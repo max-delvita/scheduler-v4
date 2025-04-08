@@ -1,6 +1,7 @@
 import { openai } from '@ai-sdk/openai';
-import { streamText, CoreMessage, StreamData } from 'ai';
+import { generateText, CoreMessage } from 'ai';
 import { supabase } from '@/lib/supabaseClient'; // Import Supabase client
+import { NextResponse } from 'next/server'; // Use NextResponse for standard JSON responses
 
 // Allow streaming responses up to 30 seconds
 export const maxDuration = 30;
@@ -43,7 +44,6 @@ function mapDbMessageToCoreMessage(dbMessage: { message_type: string; body_text:
 
 export async function POST(req: Request) {
   const emailPayload: SimulatedEmailPayload = await req.json();
-  const data = new StreamData(); // For potential future use with UI
 
   let sessionId: string | null = null;
   let conversationHistory: CoreMessage[] = [];
@@ -120,7 +120,7 @@ export async function POST(req: Request) {
 
       if (newSessionError) {
         console.error('Supabase error creating new session:', newSessionError);
-        return new Response(JSON.stringify({ error: 'Failed to create scheduling session' }), { status: 500 });
+        return NextResponse.json({ error: 'Failed to create scheduling session' }, { status: 500 });
       }
       sessionId = newSession.session_id;
       sessionOrganizer = newSession.organizer_email;
@@ -130,7 +130,7 @@ export async function POST(req: Request) {
     // Ensure we have a valid sessionId before proceeding
     if (!sessionId) {
         console.error("Failed to obtain a valid session ID.");
-        return new Response(JSON.stringify({ error: 'Failed to process scheduling session' }), { status: 500 });
+        return NextResponse.json({ error: 'Failed to process scheduling session' }, { status: 500 });
     }
 
     // 3. Determine message type and save incoming message
@@ -171,53 +171,44 @@ ${emailPayload.textBody}`;
     ];
 
     // 5. Call AI and get stream
-    const result = await streamText({
+    const { text: aiResponseText } = await generateText({
       model: openai('gpt-4o'),
       messages: messagesForAI,
     });
 
     // 6. Save AI response asynchronously AFTER stream is returned
-    (async () => {
-        try {
-            const final_text = await result.text;
+    if (aiResponseText) {
+        const { error: aiSaveError } = await supabase
+        .from('session_messages')
+        .insert({
+            session_id: sessionId,
+            sender_email: emailPayload.to[0] || 'ai@example.com',
+            recipient_email: emailPayload.from,
+            subject: `Re: ${emailPayload.subject}`,
+            body_text: aiResponseText,
+            message_type: 'ai_agent',
+        });
 
-            data.append({ sessionId });
-            data.close();
-
-            if (final_text) {
-                const { error: aiSaveError } = await supabase
-                .from('session_messages')
-                .insert({
-                    session_id: sessionId,
-                    sender_email: emailPayload.to[0] || 'ai@example.com',
-                    recipient_email: emailPayload.from,
-                    subject: `Re: ${emailPayload.subject}`,
-                    body_text: final_text,
-                    message_type: 'ai_agent',
-                });
-
-                if (aiSaveError) {
-                    console.error('Supabase error saving AI message:', aiSaveError);
-                }
-            } else {
-                console.warn('AI generated an empty response.');
-            }
-        } catch (saveError) {
-            console.error('Error saving AI response to DB:', saveError);
+        if (aiSaveError) {
+            console.error('Supabase error saving AI message:', aiSaveError);
         }
-    })().catch(err => {
-        console.error("Error initiating AI response save process:", err);
-    });
+    } else {
+        console.warn('AI generated an empty response, not saving.');
+    }
 
     // 7. Return the stream response immediately
-    return result.toDataStreamResponse({ data });
+    return NextResponse.json({
+      status: 'success',
+      sessionId: sessionId,
+      aiResponse: aiResponseText || 'AI generated an empty response.'
+    }, { status: 200 });
 
   } catch (error) {
     console.error("Unhandled error in /api/schedule:", error);
-    try { data.close(); } catch (_) {}
-    return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
+    // Ensure error is an instance of Error for safe message access
+    const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
+    return NextResponse.json({ error: 'Internal Server Error', details: errorMessage }, {
       status: 500,
-      headers: { 'Content-Type': 'application/json' },
     });
   }
 } 

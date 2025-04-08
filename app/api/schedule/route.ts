@@ -73,21 +73,26 @@ async function sendSchedulingEmail({
   to,
   subject,
   textBody,
-  replyToMessageId, // Original messageId this thread started from (or current if first reply)
-  referencesMessageId // ID of the specific message this email is replying to
+  sessionId, // Add sessionId to construct Reply-To
+  replyToMessageId, 
+  referencesMessageId
 }: {
   to: string | string[];
   subject: string;
   textBody: string;
+  sessionId: string; // Make sessionId required for sending
   replyToMessageId?: string | null;
   referencesMessageId?: string | null;
-}): Promise<string | null> { // Explicitly return MessageID or null
-  const fromAddress = process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com'; // Get sender from env or default
-  if (fromAddress === 'scheduler@yourdomain.com') {
+}): Promise<string | null> { 
+  const baseFromAddress = process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com';
+  if (baseFromAddress === 'scheduler@yourdomain.com') {
       console.warn("POSTMARK_SENDER_ADDRESS environment variable not set, using default.");
   }
+  
+  // Construct the unique Reply-To address using Mailbox Hash strategy
+  const replyToAddress = `${baseFromAddress.split('@')[0]}+${sessionId}@${baseFromAddress.split('@')[1]}`;
+  console.log(`Setting Reply-To: ${replyToAddress}`);
 
-  // Fix 1: Format headers correctly for Postmark
   const postmarkHeaders: Header[] = [];
   let refs = '';
   if (referencesMessageId) refs += `<${referencesMessageId}>`;
@@ -98,198 +103,213 @@ async function sendSchedulingEmail({
   try {
     console.log(`Attempting to send email via Postmark to: ${Array.isArray(to) ? to.join(', ') : to}`);
     const response: MessageSendingResponse = await postmarkClient.sendEmail({
-      From: fromAddress,
-      To: Array.isArray(to) ? to.join(', ') : to, // Postmark expects comma-separated string
+      From: baseFromAddress, // Send from the base address
+      To: Array.isArray(to) ? to.join(', ') : to,
       Subject: subject,
       TextBody: textBody,
-      MessageStream: 'outbound', // Or your specific message stream in Postmark
+      ReplyTo: replyToAddress, // Set the custom Reply-To header
+      MessageStream: 'outbound',
       Headers: postmarkHeaders.length > 0 ? postmarkHeaders : undefined,
     });
     console.log('Postmark email sent successfully:', response.MessageID);
-    return response.MessageID; // Return the new message ID
+    return response.MessageID;
   } catch (error) {
     console.error('Postmark send error:', error);
-    // Decide if this should throw or just log
-    // throw error; // Rethrow if sending failure should stop execution
-    return null; // Return null if we want to continue despite send failure
+    return null;
   }
 }
 
 export async function POST(req: Request) {
-  console.log("\n--- /api/schedule POST endpoint hit ---"); 
+  console.log("\n--- /api/schedule POST endpoint hit ---");
   let postmarkPayload: InboundMessageDetails;
   try {
     postmarkPayload = await req.json();
-    // console.log("Received Postmark Payload:", JSON.stringify(postmarkPayload, null, 2)); // Reduced logging
   } catch (e) {
       console.error("Failed to parse incoming request JSON:", e);
       return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 200 });
   }
 
-  // Extract key information using Postmark field names
+  // Extract key info - PRIORITIZE MailboxHash for session ID
+  const mailboxHash = postmarkPayload.MailboxHash;
   const senderEmail = postmarkPayload.FromFull?.Email || postmarkPayload.From;
-  const recipientEmail = postmarkPayload.OriginalRecipient;
+  const recipientEmail = postmarkPayload.OriginalRecipient; // This is usually the hash address
   const subject = postmarkPayload.Subject || '(no subject)';
   const textBody = postmarkPayload.TextBody || '';
   const htmlBody = postmarkPayload.HtmlBody;
   const messageId = postmarkPayload.MessageID;
 
-  // Helper function to find specific header values
   const findHeader = (name: string): string | undefined => {
       return postmarkPayload.Headers?.find((h: Header) => h.Name.toLowerCase() === name.toLowerCase())?.Value;
   }
-
-  // Clean the In-Reply-To header to extract only the core ID part for consistent DB lookup
   const inReplyToHeaderRaw = findHeader('In-Reply-To');
-  let inReplyToClean = inReplyToHeaderRaw?.replace(/[<>]/g, ''); // Remove brackets first
-  if (inReplyToClean?.includes('@')) {
-      inReplyToClean = inReplyToClean.split('@')[0]; // Take only the part before @
-  }
   const referencesHeader = findHeader('References');
 
-  // Log extracted info for debugging
-  console.log(`Extracted Info: From=${senderEmail}, Subject=${subject}, MessageID=${messageId}, InReplyTo=${inReplyToClean || 'None'}`);
+  console.log(`Extracted Info: From=${senderEmail}, Subject=${subject}, MessageID=${messageId}, MailboxHash=${mailboxHash || 'None'}, InReplyToRaw=${inReplyToHeaderRaw || 'None'}`);
 
   let sessionId: string | null = null;
   let conversationHistory: CoreMessage[] = [];
   let sessionOrganizer: string | null = null;
   let sessionParticipants: string[] = [];
-  let initialMessageIdForThread: string | null = null;
+  let initialMessageIdForThread: string | null = null; // Still useful for References header
 
   try {
-    // 1. Identify Session based on the CLEANED In-Reply-To header
-    if (inReplyToClean) {
-      console.log(`Looking for message with postmark_message_id = ${inReplyToClean}`);
-      const { data: originatingMessage, error: msgError } = await supabase
-        .from('session_messages')
-        .select('session_id, sessions:scheduling_sessions(organizer_email, participants)')
-        .eq('postmark_message_id', inReplyToClean) // Use the cleaned header value
-        .maybeSingle();
+    // --- Session Identification: Prioritize MailboxHash --- 
+    if (mailboxHash && mailboxHash.length > 10) { // Basic check if hash looks valid (e.g., like a UUID)
+       console.log(`Attempting session lookup using MailboxHash: ${mailboxHash}`);
+       sessionId = mailboxHash; // Assuming the hash *is* the session ID
+        // Fetch session data directly using the likely session ID
+        const { data: sessionDirect, error: sessionDirectErr } = await supabase
+            .from('scheduling_sessions')
+            .select('organizer_email, participants')
+            .eq('session_id', sessionId)
+            .maybeSingle(); // Use maybeSingle as hash might be invalid
 
-      if (msgError) {
-        console.error('Supabase error fetching originating message by In-Reply-To:', msgError);
-      } else if (originatingMessage && originatingMessage.session_id) {
-        console.log(`Found existing session: ${originatingMessage.session_id}`);
-        sessionId = originatingMessage.session_id;
-        const sessionsData = originatingMessage.sessions as any; // Use any temporarily for simplicity
-         if (sessionsData) {
-             sessionOrganizer = sessionsData.organizer_email;
-             sessionParticipants = sessionsData.participants || [];
-         } else {
-             const { data: sessionDirect, error: sessionDirectErr } = await supabase
-                .from('scheduling_sessions')
-                .select('organizer_email, participants')
-                .eq('session_id', sessionId)
-                .single();
-            if (sessionDirectErr) console.error('Fallback session fetch error:', sessionDirectErr);
-            else if (sessionDirect) {
-                sessionOrganizer = sessionDirect.organizer_email;
-                sessionParticipants = sessionDirect.participants || [];
-            }
-         }
+        if (sessionDirectErr) {
+            console.error('Supabase error fetching session by MailboxHash:', sessionDirectErr);
+            sessionId = null; // Reset session ID if lookup failed
+        } else if (sessionDirect) {
+            console.log(`Found session via MailboxHash: ${sessionId}`);
+            sessionOrganizer = sessionDirect.organizer_email;
+            sessionParticipants = sessionDirect.participants || [];
+        } else {
+            console.log(`MailboxHash ${mailboxHash} did not match any existing session.`);
+            sessionId = null; // Reset session ID
+        }
+    } else {
+        console.log("No valid MailboxHash found.");
+    }
 
-        if (sessionId) {
-            const { data: historyMessages, error: historyError } = await supabase
+    // --- Fallback to In-Reply-To if MailboxHash didn't yield a session --- 
+    if (!sessionId && inReplyToHeaderRaw) {
+        const inReplyToClean = inReplyToHeaderRaw.replace(/[<>]/g, '').split('@')[0];
+        console.log(`MailboxHash failed, falling back to InReplyTo lookup: ${inReplyToClean}`);
+        // ... (The existing In-Reply-To lookup logic) ...
+         const { data: originatingMessage, error: msgError } = await supabase
+           .from('session_messages')
+           .select('session_id, sessions:scheduling_sessions(organizer_email, participants)')
+           .eq('postmark_message_id', inReplyToClean)
+           .maybeSingle();
+        // ... etc ... 
+          if (msgError) {
+            console.error('Supabase error fetching originating message by In-Reply-To:', msgError);
+          } else if (originatingMessage && originatingMessage.session_id) {
+            console.log(`Found existing session via InReplyTo fallback: ${originatingMessage.session_id}`);
+             sessionId = originatingMessage.session_id;
+             // Re-fetch session data if needed or trust joined data
+             const sessionsData = originatingMessage.sessions as any;
+              if (sessionsData) {
+                  sessionOrganizer = sessionsData.organizer_email;
+                  sessionParticipants = sessionsData.participants || [];
+              } else {
+                 // Fallback fetch if join was bad
+                 const { data: sessionDirect, error: sessionDirectErr } = await supabase
+                    .from('scheduling_sessions')
+                    .select('organizer_email, participants')
+                    .eq('session_id', sessionId)
+                    .single();
+                 if (sessionDirectErr) console.error('Fallback session fetch error:', sessionDirectErr);
+                 else if (sessionDirect) {
+                     sessionOrganizer = sessionDirect.organizer_email;
+                     sessionParticipants = sessionDirect.participants || [];
+                 }
+              }
+          } else {
+               console.log(`InReplyTo fallback also failed for: ${inReplyToClean}.`);
+          }
+    }
+
+    // --- Load History if Session was Found (by either method) --- 
+    if (sessionId) {
+         console.log(`Loading history for session: ${sessionId}`);
+         const { data: historyMessages, error: historyError } = await supabase
             .from('session_messages')
-            .select('message_type, body_text, postmark_message_id') // Include message ID for threading
+            .select('message_type, body_text, postmark_message_id')
             .eq('session_id', sessionId)
             .order('created_at', { ascending: true });
 
-            if (historyError) {
-              console.error('Supabase error fetching history:', historyError);
-            } else if (historyMessages) {
-              conversationHistory = historyMessages
-                .map(mapDbMessageToCoreMessage)
-                .filter((msg): msg is CoreMessage => msg !== null);
-              // Find the earliest message ID for the References header
-              initialMessageIdForThread = historyMessages[0]?.postmark_message_id || inReplyToClean;
-              console.log(`Loaded ${conversationHistory.length} history messages.`);
-            }
-        }
-      } else {
-          console.log(`No message found matching In-Reply-To: ${inReplyToClean}. Treating as potentially new thread.`);
-      }
+         if (historyError) {
+           console.error('Supabase error fetching history:', historyError);
+         } else if (historyMessages && historyMessages.length > 0) {
+           conversationHistory = historyMessages
+             .map(mapDbMessageToCoreMessage)
+             .filter((msg): msg is CoreMessage => msg !== null);
+           // Use the FIRST message's ID for the overall thread reference
+           initialMessageIdForThread = historyMessages[0]?.postmark_message_id || null;
+           console.log(`Loaded ${conversationHistory.length} history messages.`);
+         } else {
+             console.log("Session found, but no history messages retrieved.");
+             // If history is empty, maybe use the current message ID as the initial reference?
+             initialMessageIdForThread = messageId || null;
+         }
     }
 
-    // 2. Handle New Session if no existing session was found
+    // --- New Session Creation (Only if NO session found by hash or header) ---
     if (!sessionId) {
-        console.log("No existing session found, creating new one.");
+        // ... (Keep existing new session creation logic, using extracted participants etc.) ...
+         console.log("No existing session identified by hash or header, creating new one.");
+         const agentEmail = (process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com').toLowerCase();
+         let potentialParticipants: string[] = [];
 
-        // --- Participant Extraction from To/Cc (Handles initial CC scenario) ---
-        const agentEmail = (process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com').toLowerCase();
-        let potentialParticipants: string[] = [];
+         if (postmarkPayload.ToFull && Array.isArray(postmarkPayload.ToFull)) {
+             potentialParticipants = potentialParticipants.concat(
+                 postmarkPayload.ToFull.map(recipient => recipient.Email)
+             );
+         }
+         if (postmarkPayload.CcFull && Array.isArray(postmarkPayload.CcFull)) {
+             potentialParticipants = potentialParticipants.concat(
+                 postmarkPayload.CcFull.map(recipient => recipient.Email)
+             );
+         }
 
-        // Add recipients from ToFull array
-        if (postmarkPayload.ToFull && Array.isArray(postmarkPayload.ToFull)) {
-            potentialParticipants = potentialParticipants.concat(
-                postmarkPayload.ToFull.map(recipient => recipient.Email)
-            );
-        }
-        // Add recipients from CcFull array
-        if (postmarkPayload.CcFull && Array.isArray(postmarkPayload.CcFull)) {
-            potentialParticipants = potentialParticipants.concat(
-                postmarkPayload.CcFull.map(recipient => recipient.Email)
-            );
-        }
+         sessionParticipants = [...new Set(potentialParticipants)]
+             .filter(email => email.toLowerCase() !== senderEmail.toLowerCase() && email.toLowerCase() !== agentEmail);
+         console.log(`Identified Participants (from To/Cc, excluding sender/agent): ${sessionParticipants.join(', ') || 'None'}`);
 
-        // Filter out the sender and the agent's own email, ensure lowercase comparison
-        sessionParticipants = [...new Set(potentialParticipants)] // Remove duplicates first
-            .filter(email => email.toLowerCase() !== senderEmail.toLowerCase() && email.toLowerCase() !== agentEmail);
+         if (sessionParticipants.length === 0) {
+              console.log("No participants found in To/Cc, attempting regex fallback on body...");
+              const participantsMatch = textBody.match(/Participants?:\s*\n?([\s\S]*?)(?:\n\n|Thanks|Best regards)/i);
+              const extractedParticipants = participantsMatch ? participantsMatch[1].split('\n').map(p => p.replace(/^-/, '').trim()).filter((p: string) => p.includes('@')) : [];
+              sessionParticipants = extractedParticipants.filter(email => email.toLowerCase() !== senderEmail.toLowerCase() && email.toLowerCase() !== agentEmail);
+              console.log(`Regex Fallback Participants: ${sessionParticipants.join(', ') || 'None'}`);
+         }
 
-        console.log(`Identified Participants (from To/Cc, excluding sender/agent): ${sessionParticipants.join(', ') || 'None'}`);
+       const { data: newSession, error: newSessionError } = await supabase
+         .from('scheduling_sessions')
+         .insert({
+           organizer_email: senderEmail,
+           meeting_topic: subject,
+           status: 'pending',
+           webhook_target_address: recipientEmail || 'unknown',
+           participants: sessionParticipants,
+         })
+         .select('session_id, organizer_email, participants')
+         .single();
 
-        // Fallback: If To/Cc parsing yielded no participants, maybe try regex as last resort?
-        if (sessionParticipants.length === 0) {
-             console.log("No participants found in To/Cc, attempting regex fallback on body...");
-             const participantsMatch = textBody.match(/Participants?:\s*\n?([\s\S]*?)(?:\n\n|Thanks|Best regards)/i);
-             const extractedParticipants = participantsMatch ? participantsMatch[1].split('\n').map(p => p.replace(/^-/, '').trim()).filter((p: string) => p.includes('@')) : [];
-             // Ensure these aren't the sender or agent either
-             sessionParticipants = extractedParticipants.filter(email => email.toLowerCase() !== senderEmail.toLowerCase() && email.toLowerCase() !== agentEmail);
-             console.log(`Regex Fallback Participants: ${sessionParticipants.join(', ') || 'None'}`);
-        }
-        // --- End Participant Extraction ---
-
-      const { data: newSession, error: newSessionError } = await supabase
-        .from('scheduling_sessions')
-        .insert({
-          organizer_email: senderEmail,
-          meeting_topic: subject,
-          status: 'pending',
-          webhook_target_address: recipientEmail || 'unknown',
-          participants: sessionParticipants, // Use the correctly identified participants
-        })
-        .select('session_id, organizer_email, participants')
-        .single();
-
-      if (newSessionError) {
-        console.error('Supabase error creating new session:', newSessionError);
-        return NextResponse.json({ error: 'Failed to create scheduling session' }, { status: 200 });
-      }
-      sessionId = newSession.session_id;
-      sessionOrganizer = newSession.organizer_email;
-      // Ensure sessionParticipants uses the value from the newly created record
-      sessionParticipants = newSession.participants || [];
-      conversationHistory = [];
-      // @ts-ignore - Bypassing persistent and likely incorrect type error
-      initialMessageIdForThread = messageId || null;
-      console.log(`Created new session: ${sessionId}`);
+       if (newSessionError) {
+         console.error('Supabase error creating new session:', newSessionError);
+         return NextResponse.json({ error: 'Failed to create scheduling session' }, { status: 200 });
+       }
+       sessionId = newSession.session_id;
+       sessionOrganizer = newSession.organizer_email;
+       sessionParticipants = newSession.participants || [];
+       conversationHistory = [];
+       initialMessageIdForThread = messageId || null; 
+       console.log(`Created new session: ${sessionId}`);
     }
 
-    // Ensure we have a valid sessionId before proceeding
+    // --- Guard: Ensure we have a valid sessionId now --- 
     if (!sessionId) {
-        console.error("Failed to obtain a valid session ID.");
+        console.error("Failed to obtain a valid session ID after all checks.");
         return NextResponse.json({ error: 'Failed to process scheduling session' }, { status: 200 });
     }
 
-    // 3. Determine message type and save incoming message
+    // --- Save Incoming Message (Ensure in_reply_to uses cleaned ID) --- 
     const incomingMessageType =
       sessionOrganizer && senderEmail === sessionOrganizer
         ? 'human_organizer'
         : 'human_participant';
-
-    const { error: insertError } = await supabase
-      .from('session_messages')
-      .insert({
+    console.log(`Saving incoming message as type: ${incomingMessageType}`);
+    const { error: insertError } = await supabase.from('session_messages').insert({
         session_id: sessionId,
         postmark_message_id: messageId,
         sender_email: senderEmail,
@@ -297,59 +317,47 @@ export async function POST(req: Request) {
         subject: subject,
         body_text: textBody,
         body_html: htmlBody,
-        in_reply_to_message_id: inReplyToClean || null,
+        // Use the cleaned ID (UUID part) if available from header
+        in_reply_to_message_id: inReplyToHeaderRaw?.replace(/[<>]/g, '').split('@')[0] || null,
         message_type: incomingMessageType,
-      });
+    });
+    if (insertError) console.error('Supabase error saving incoming message:', insertError);
+    else console.log("Incoming message saved to DB.");
 
-    if (insertError) {
-      console.error('Supabase error saving incoming message:', insertError);
-    }
-
-    // 4. Format current email for AI and construct full message list
-    // Explicitly include identified participants in the context for the AI
+    // --- Prepare for AI (Include explicit participant list) --- 
     const currentMessageContent = `Received email:
 From: ${senderEmail}
 Subject: ${subject}
-Participants involved in this request: ${sessionParticipants.join(', ') || 'None identified'}
+Participants involved in this session: ${sessionParticipants.join(', ') || 'None listed'}
 
 Email Body:
 ${textBody}`;
-
     const messagesForAI: CoreMessage[] = [
-      // System message is now part of generateObject call
       ...conversationHistory,
-      { role: 'user', content: currentMessageContent }, // Pass enriched context
+      { role: 'user', content: currentMessageContent },
     ];
     console.log(`Sending ${messagesForAI.length} messages to AI (excluding system prompt).`);
 
-    // 5. Call AI and get stream
+    // --- Call AI using generateObject --- 
     console.log("Calling generateObject...");
     const { object: aiDecision, usage } = await generateObject({
       model: openai('gpt-4o'),
       schema: schedulingDecisionSchema,
-      system: systemMessage, // Pass the enhanced system prompt here
+      system: systemMessage,
       messages: messagesForAI,
     });
     console.log("AI Usage:", usage);
     console.log("AI Decision Object:", JSON.stringify(aiDecision, null, 2));
 
-    // --- Determine Recipients and Send Email based on AI Decision --- 
+    // --- Determine Recipients based on AI Decision & DB Data --- 
     let outgoingMessageId: string | null = null;
-    const { next_step, recipients: aiSuggestedRecipients, email_body } = aiDecision; // Get AI suggestion
-
-    // Override recipients based on explicit logic and DB data
+    const { next_step, recipients: aiSuggestedRecipients, email_body } = aiDecision;
     let finalRecipients: string[] = [];
 
-    // Determine recipients based on the *AI's chosen next_step* and *session data*
     if (next_step === 'ask_participant_availability' || next_step === 'propose_time_to_participant') {
-        // Ask/propose to participant(s) - AI *should* list them, but we can cross-check
-        // For now, let's trust the AI's recipient list for these steps, assuming it targets participants correctly
         finalRecipients = aiSuggestedRecipients || [];
-        // We might add filtering later to ensure they are actual participants if needed
          console.log(`Step requires emailing participant(s). Using AI recipients: ${finalRecipients.join(', ')}`);
-
     } else if (next_step === 'propose_time_to_organizer' || next_step === 'request_clarification') {
-        // Contact the organizer ONLY
         if (sessionOrganizer) {
             finalRecipients = [sessionOrganizer];
              console.log(`Step requires emailing organizer. Using DB organizer: ${sessionOrganizer}`);
@@ -358,33 +366,30 @@ ${textBody}`;
             finalRecipients = [];
         }
     } else if (next_step === 'send_final_confirmation') {
-        // Contact EVERYONE (organizer + all participants)
         const allParties = [
             ...(sessionOrganizer ? [sessionOrganizer] : []),
             ...sessionParticipants
         ];
-        finalRecipients = [...new Set(allParties)]; // Ensure unique
+        finalRecipients = [...new Set(allParties)];
         console.log(`Step requires emailing everyone. Final list: ${finalRecipients.join(', ')}`);
     } else {
-        // Includes 'no_action_needed', 'error_cannot_schedule'
         console.log(`Step is ${next_step}. No email recipients.`);
         finalRecipients = [];
     }
 
-
+    // --- Send Email if needed --- 
     if (finalRecipients.length > 0 && email_body && email_body.trim().length > 0) {
         console.log(`Final determined recipients: ${finalRecipients.join(', ')}`);
         const outgoingSubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
-        // Call send function and store the returned message ID
         outgoingMessageId = await sendSchedulingEmail({
-            to: finalRecipients, // Use the corrected list
+            to: finalRecipients,
             subject: outgoingSubject,
             textBody: email_body,
-            // Pass message IDs needed for threading headers
-            replyToMessageId: initialMessageIdForThread, // Base thread ID from first message
-            referencesMessageId: messageId // ID of the specific incoming message we're replying to
+            sessionId, // Pass session ID for Reply-To construction
+            replyToMessageId: initialMessageIdForThread,
+            referencesMessageId: messageId
         });
-    // Save AI response AFTER attempting to send email
+    // --- Save AI Response --- 
     console.log("Saving AI response to DB.");
     const { error: aiSaveError } = await supabase
             .from('session_messages')
@@ -392,35 +397,34 @@ ${textBody}`;
                 session_id: sessionId,
                 postmark_message_id: outgoingMessageId || null,
                 sender_email: process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com',
-                recipient_email: finalRecipients.join(', ') || null, // Log who it was actually sent to
+                recipient_email: finalRecipients.join(', ') || null,
                 subject: outgoingSubject,
-                body_text: email_body, // Save the body generated by AI
+                body_text: email_body,
                 message_type: 'ai_agent',
-                 // @ts-ignore - Bypassing persistent and likely incorrect type error
-                in_reply_to_message_id: messageId as any, // Link AI reply to incoming message ID
+                // @ts-ignore - Still need to bypass this for incoming messageId?
+                in_reply_to_message_id: messageId || null, // Link to the ID of the triggering email
             });
     if (aiSaveError) console.error('Supabase error saving AI message:', aiSaveError);
     else console.log("AI Response saved to DB.");
 
-    if (finalRecipients.length === 0) {
-            console.log("AI generated a response, but no recipients determined. Email not sent.");
-      }
-
     } else {
       console.warn(`AI decided next step: ${next_step}, but no valid recipients/body found. No email sent.`);
-      // Optionally save a record that no action was taken?
     }
 
-    // 8. Return the stream response immediately
+    // --- Update Session State --- 
+    const { error: updateSessionError } = await supabase
+      .from('scheduling_sessions')
+      .update({ current_step: next_step })
+      .eq('session_id', sessionId);
+    if (updateSessionError) console.error('Supabase error updating session step:', updateSessionError);
+
+    // --- Return Success Response to Postmark --- 
     console.log("Processing complete, returning 200 OK to Postmark.");
-    // Return simple success; Postmark doesn't need the AI response content back.
     return NextResponse.json({ status: 'success', decision: aiDecision }, { status: 200 });
 
   } catch (error) {
     console.error("Unhandled error in /api/schedule:", error);
-    // Ensure error is an instance of Error for safe message access
     const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
-    // Still return 200 to Postmark to prevent retries, but log the error.
     return NextResponse.json({ error: 'Internal Server Error', details: errorMessage }, { status: 200 });
   }
 } 

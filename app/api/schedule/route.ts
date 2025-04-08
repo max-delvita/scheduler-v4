@@ -116,16 +116,13 @@ async function sendSchedulingEmail({
 }
 
 export async function POST(req: Request) {
-  console.log("\n--- /api/schedule POST endpoint hit ---"); // ADDED FOR DEBUGGING
+  console.log("\n--- /api/schedule POST endpoint hit ---"); 
   let postmarkPayload: InboundMessageDetails;
   try {
-    // Use the actual Postmark InboundMessage type for parsing
     postmarkPayload = await req.json();
-    console.log("Received Postmark Payload:", JSON.stringify(postmarkPayload, null, 2)); // Log the full payload for debugging
+    // console.log("Received Postmark Payload:", JSON.stringify(postmarkPayload, null, 2)); // Reduced logging
   } catch (e) {
       console.error("Failed to parse incoming request JSON:", e);
-      // Postmark expects a 200 OK even on failure, otherwise it retries.
-      // Log the error but return 200.
       return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 200 });
   }
 
@@ -142,27 +139,31 @@ export async function POST(req: Request) {
       return postmarkPayload.Headers?.find((h: Header) => h.Name.toLowerCase() === name.toLowerCase())?.Value;
   }
 
-  const inReplyToHeader = findHeader('In-Reply-To')?.replace(/[<>]/g, ''); // Clean <> chars
-  const referencesHeader = findHeader('References'); // Keep this raw for now
+  // Clean the In-Reply-To header to extract only the core ID part for consistent DB lookup
+  const inReplyToHeaderRaw = findHeader('In-Reply-To');
+  let inReplyToClean = inReplyToHeaderRaw?.replace(/[<>]/g, ''); // Remove brackets first
+  if (inReplyToClean?.includes('@')) {
+      inReplyToClean = inReplyToClean.split('@')[0]; // Take only the part before @
+  }
+  const referencesHeader = findHeader('References');
 
   // Log extracted info for debugging
-  console.log(`Extracted Info: From=${senderEmail}, To=${recipientEmail}, Subject=${subject}, MessageID=${messageId}, InReplyTo=${inReplyToHeader}`);
+  console.log(`Extracted Info: From=${senderEmail}, Subject=${subject}, MessageID=${messageId}, InReplyTo=${inReplyToClean || 'None'}`);
 
   let sessionId: string | null = null;
   let conversationHistory: CoreMessage[] = [];
   let sessionOrganizer: string | null = null;
-  let sessionParticipants: string[] = []; // Store participant list
-  let initialMessageIdForThread: string | null = null; // Track the first message ID for References header
+  let sessionParticipants: string[] = [];
+  let initialMessageIdForThread: string | null = null;
 
   try {
-    // 1. Identify Session based on In-Reply-To header
-    if (inReplyToHeader) {
-      console.log(`Looking for message with postmark_message_id = ${inReplyToHeader}`);
+    // 1. Identify Session based on the CLEANED In-Reply-To header
+    if (inReplyToClean) {
+      console.log(`Looking for message with postmark_message_id = ${inReplyToClean}`);
       const { data: originatingMessage, error: msgError } = await supabase
         .from('session_messages')
-        // Fetch session details directly including participants
         .select('session_id, sessions:scheduling_sessions(organizer_email, participants)')
-        .eq('postmark_message_id', inReplyToHeader)
+        .eq('postmark_message_id', inReplyToClean) // Use the cleaned header value
         .maybeSingle();
 
       if (msgError) {
@@ -175,7 +176,6 @@ export async function POST(req: Request) {
              sessionOrganizer = sessionsData.organizer_email;
              sessionParticipants = sessionsData.participants || [];
          } else {
-            // Fallback: fetch session data directly if join failed/was null
              const { data: sessionDirect, error: sessionDirectErr } = await supabase
                 .from('scheduling_sessions')
                 .select('organizer_email, participants')
@@ -202,10 +202,12 @@ export async function POST(req: Request) {
                 .map(mapDbMessageToCoreMessage)
                 .filter((msg): msg is CoreMessage => msg !== null);
               // Find the earliest message ID for the References header
-              initialMessageIdForThread = historyMessages[0]?.postmark_message_id || inReplyToHeader;
+              initialMessageIdForThread = historyMessages[0]?.postmark_message_id || inReplyToClean;
               console.log(`Loaded ${conversationHistory.length} history messages.`);
             }
         }
+      } else {
+          console.log(`No message found matching In-Reply-To: ${inReplyToClean}. Treating as potentially new thread.`);
       }
     }
 
@@ -295,7 +297,7 @@ export async function POST(req: Request) {
         subject: subject,
         body_text: textBody,
         body_html: htmlBody,
-        in_reply_to_message_id: inReplyToHeader || null,
+        in_reply_to_message_id: inReplyToClean || null,
         message_type: incomingMessageType,
       });
 
@@ -331,40 +333,82 @@ ${textBody}`;
     console.log("AI Usage:", usage);
     console.log("AI Decision Object:", JSON.stringify(aiDecision, null, 2));
 
-    // 6. Determine Recipients and Send Email via Postmark
+    // --- Determine Recipients and Send Email based on AI Decision --- 
     let outgoingMessageId: string | null = null;
+    const { next_step, recipients: aiSuggestedRecipients, email_body } = aiDecision; // Get AI suggestion
 
-    if (aiDecision.next_step !== 'no_action_needed' && aiDecision.next_step !== 'error_cannot_schedule' && aiDecision.recipients && aiDecision.recipients.length > 0 && aiDecision.email_body && aiDecision.email_body.trim().length > 0) {
-      console.log(`AI decided next step: ${aiDecision.next_step}. Sending email to: ${aiDecision.recipients.join(', ')}`);
-      const outgoingSubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
-      outgoingMessageId = await sendSchedulingEmail({
-        to: aiDecision.recipients,
-        subject: outgoingSubject,
-        textBody: aiDecision.email_body,
-        replyToMessageId: initialMessageIdForThread,
-        referencesMessageId: messageId
-      });
+    // Override recipients based on explicit logic and DB data
+    let finalRecipients: string[] = [];
 
-      // 7. Save AI response AFTER attempting to send email
-      console.log("Saving AI response to DB.");
-      const { error: aiSaveError } = await supabase
-        .from('session_messages')
-        .insert({
-          session_id: sessionId,
-          postmark_message_id: outgoingMessageId || null,
-          sender_email: process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com',
-          recipient_email: aiDecision.recipients.join(', ') || null,
-          subject: outgoingSubject,
-          body_text: aiDecision.email_body,
-          message_type: 'ai_agent',
-          // Use `any` as a last resort to bypass persistent TS error
-          in_reply_to_message_id: messageId as any,
+    // Determine recipients based on the *AI's chosen next_step* and *session data*
+    if (next_step === 'ask_participant_availability' || next_step === 'propose_time_to_participant') {
+        // Ask/propose to participant(s) - AI *should* list them, but we can cross-check
+        // For now, let's trust the AI's recipient list for these steps, assuming it targets participants correctly
+        finalRecipients = aiSuggestedRecipients || [];
+        // We might add filtering later to ensure they are actual participants if needed
+         console.log(`Step requires emailing participant(s). Using AI recipients: ${finalRecipients.join(', ')}`);
+
+    } else if (next_step === 'propose_time_to_organizer' || next_step === 'request_clarification') {
+        // Contact the organizer ONLY
+        if (sessionOrganizer) {
+            finalRecipients = [sessionOrganizer];
+             console.log(`Step requires emailing organizer. Using DB organizer: ${sessionOrganizer}`);
+        } else {
+            console.error(`Cannot perform step ${next_step}: Session organizer is unknown.`);
+            finalRecipients = [];
+        }
+    } else if (next_step === 'send_final_confirmation') {
+        // Contact EVERYONE (organizer + all participants)
+        const allParties = [
+            ...(sessionOrganizer ? [sessionOrganizer] : []),
+            ...sessionParticipants
+        ];
+        finalRecipients = [...new Set(allParties)]; // Ensure unique
+        console.log(`Step requires emailing everyone. Final list: ${finalRecipients.join(', ')}`);
+    } else {
+        // Includes 'no_action_needed', 'error_cannot_schedule'
+        console.log(`Step is ${next_step}. No email recipients.`);
+        finalRecipients = [];
+    }
+
+
+    if (finalRecipients.length > 0 && email_body && email_body.trim().length > 0) {
+        console.log(`Final determined recipients: ${finalRecipients.join(', ')}`);
+        const outgoingSubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
+        // Call send function and store the returned message ID
+        outgoingMessageId = await sendSchedulingEmail({
+            to: finalRecipients, // Use the corrected list
+            subject: outgoingSubject,
+            textBody: email_body,
+            // Pass message IDs needed for threading headers
+            replyToMessageId: initialMessageIdForThread, // Base thread ID from first message
+            referencesMessageId: messageId // ID of the specific incoming message we're replying to
         });
+    // Save AI response AFTER attempting to send email
+    console.log("Saving AI response to DB.");
+    const { error: aiSaveError } = await supabase
+            .from('session_messages')
+            .insert({
+                session_id: sessionId,
+                postmark_message_id: outgoingMessageId || null,
+                sender_email: process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com',
+                recipient_email: finalRecipients.join(', ') || null, // Log who it was actually sent to
+                subject: outgoingSubject,
+                body_text: email_body, // Save the body generated by AI
+                message_type: 'ai_agent',
+                 // @ts-ignore - Bypassing persistent and likely incorrect type error
+                in_reply_to_message_id: messageId as any, // Link AI reply to incoming message ID
+            });
+    if (aiSaveError) console.error('Supabase error saving AI message:', aiSaveError);
+    else console.log("AI Response saved to DB.");
 
-      if (aiSaveError) console.error('Supabase error saving AI message:', aiSaveError);
+    if (finalRecipients.length === 0) {
+            console.log("AI generated a response, but no recipients determined. Email not sent.");
+      }
 
     } else {
-      console.warn('AI generated an empty response. No email sent, not saving AI message.');
+      console.warn(`AI decided next step: ${next_step}, but no valid recipients/body found. No email sent.`);
+      // Optionally save a record that no action was taken?
     }
 
     // 8. Return the stream response immediately

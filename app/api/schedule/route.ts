@@ -129,14 +129,15 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 200 });
   }
 
-  // Extract key info - PRIORITIZE MailboxHash for session ID
+  // Extract key info
   const mailboxHash = postmarkPayload.MailboxHash;
   const senderEmail = postmarkPayload.FromFull?.Email || postmarkPayload.From;
-  const recipientEmail = postmarkPayload.OriginalRecipient; // This is usually the hash address
+  const recipientEmail = postmarkPayload.OriginalRecipient;
   const subject = postmarkPayload.Subject || '(no subject)';
   const textBody = postmarkPayload.TextBody || '';
   const htmlBody = postmarkPayload.HtmlBody;
   const messageId = postmarkPayload.MessageID;
+  const agentEmail = (process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com').toLowerCase();
 
   const findHeader = (name: string): string | undefined => {
       return postmarkPayload.Headers?.find((h: Header) => h.Name.toLowerCase() === name.toLowerCase())?.Value;
@@ -144,6 +145,41 @@ export async function POST(req: Request) {
   const inReplyToHeaderRaw = findHeader('In-Reply-To');
   const referencesHeader = findHeader('References');
 
+  // --- Loop Prevention & Logging Check --- 
+  if (senderEmail.toLowerCase() === agentEmail) {
+    console.log(`Received email FROM the agent itself (${senderEmail}). Checking for MailboxHash...`);
+    if (!mailboxHash || mailboxHash.length < 10) { // Basic check if hash looks like a session ID
+        console.warn(`Email from agent lacks valid MailboxHash. Assuming loop/error. Saving to discarded_agent_emails and discarding.`);
+        
+        // Save the problematic payload for later investigation
+        try {
+            const { error: logError } = await supabase
+                .from('discarded_agent_emails')
+                .insert({
+                    postmark_message_id: messageId,
+                    subject: subject,
+                    from_email: senderEmail,
+                    to_recipients: postmarkPayload.To, // Raw To string
+                    cc_recipients: postmarkPayload.Cc, // Raw Cc string
+                    in_reply_to_header: inReplyToHeaderRaw,
+                    body_text: textBody,
+                    full_payload: postmarkPayload // Store the whole object
+                });
+            if (logError) {
+                console.error("Failed to save discarded email payload to DB:", logError);
+            }
+        } catch (dbError) {
+            console.error("Exception while saving discarded email payload:", dbError);
+        }
+        
+        // Return 200 OK to Postmark to stop retries
+        return NextResponse.json({ status: 'discarded_agent_loop_detected' }, { status: 200 }); 
+    }
+    console.log("Email from agent HAS MailboxHash, proceeding with session lookup (unexpected but allowed)...");
+  }
+  // --- End Loop Prevention Check ---
+
+  // Log key extracted info if proceeding
   console.log(`Extracted Info: From=${senderEmail}, Subject=${subject}, MessageID=${messageId}, MailboxHash=${mailboxHash || 'None'}, InReplyToRaw=${inReplyToHeaderRaw || 'None'}`);
 
   let sessionId: string | null = null;

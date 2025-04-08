@@ -1,5 +1,6 @@
 import { openai } from '@ai-sdk/openai';
-import { generateText, CoreMessage } from 'ai';
+import { generateObject, CoreMessage } from 'ai';
+import { z } from 'zod'; // Import Zod
 import { supabase } from '@/lib/supabaseClient'; // Import Supabase client
 import { postmarkClient } from '@/lib/postmarkClient'; // Import Postmark client
 import { NextResponse } from 'next/server'; // Use NextResponse for standard JSON responses
@@ -9,15 +10,48 @@ import type { InboundMessageDetails } from 'postmark/dist/client/models/messages
 // Allow streaming responses up to 30 seconds
 export const maxDuration = 30;
 
-// Define the initial system message to guide the AI
+// Define the Zod schema for the AI's structured output
+const schedulingDecisionSchema = z.object({
+  next_step: z.enum([
+    'request_clarification', // Need more info from sender
+    'ask_participant_availability', // Need to email participants for times
+    'propose_time_to_organizer', // Have availability, need organizer confirmation
+    'propose_time_to_participant', // Need to ask another participant about a proposed time
+    'send_final_confirmation', // All agreed, send calendar invite details
+    'no_action_needed', // e.g., received a simple thank you, nothing to schedule/reply to
+    'error_cannot_schedule', // Cannot fulfill the request
+  ]).describe("The next logical step in the scheduling process based on the conversation."),
+  recipients: z.array(z.string().email()).describe("An array of email addresses to send the generated email_body to. Should be empty if next_step is 'no_action_needed' or 'error_cannot_schedule'."),
+  email_body: z.string().describe("The content of the email body to send to the specified recipients. Should be empty if next_step is 'no_action_needed'. Format as plain text."),
+  // Optional fields we might add later:
+  // proposed_datetime: z.string().optional().describe("ISO 8601 string if a specific time is being proposed."),
+  // confirmed_datetime: z.string().optional().describe("ISO 8601 string if a time has been confirmed."),
+});
+
+// Enhanced System Prompt for Structured Output
 const systemMessage = `You are an AI assistant specialized in scheduling meetings via email conversations.
-Your goal is to understand meeting requests, interact with organizers and participants to find suitable times, and confirm the meeting details.
-Analyze the incoming email content (sender, subject, body) and the conversation history to determine the intent (e.g., new request, availability response, confirmation) and necessary information (topic, participants, suggested times).
-Respond clearly and professionally, guiding the conversation towards a successful scheduling outcome.
-If crucial information is missing, ask for it politely.
-When proposing times, be clear.
-When confirming, summarize the details accurately.
-IMPORTANT: Your final output text should be ONLY the body of the email you want to send next. Do not include Subject lines or salutations like "Hi Bob," unless that specific person is the *only* recipient of this *next* email. If addressing multiple people, start the email body directly.`;
+Your primary goal is to coordinate a meeting time between an organizer and one or more participants.
+
+Follow these steps:
+1.  Analyze the incoming email (From, Subject, Body) and the entire conversation history.
+2.  Determine the current state and the most logical next step in the scheduling process.
+3.  Identify the specific recipient(s) for the next communication.
+4.  Generate the plain text email body for the next communication.
+5.  Output your decision using the provided JSON schema with fields: 'next_step', 'recipients', 'email_body'.
+
+Workflow Stages & 'next_step' values:
+*   Initial Request Received (often CC'd): Identify participants from To/Cc (excluding organizer/self). The identified participants are listed in the user message. If the core intent is clearly to schedule a meeting and at least one participant is identified, prioritize using 'ask_participant_availability' and set 'recipients' to ONLY those identified participant emails. Assume standard meeting duration (e.g., 30-60 mins) if unspecified. Only use 'request_clarification' (emailing the organizer) if the meeting's *purpose* is completely unclear OR if *no participants* could be identified.
+*   Receiving Availability: If more participants need checking, use 'ask_participant_availability' or 'propose_time_to_participant' for the *next* participant listed in the session. If all participants responded, use 'propose_time_to_organizer' and email *only* the organizer with proposed time(s).
+*   Organizer Confirmation: If organizer agrees, use 'send_final_confirmation' and include *all* participants and the organizer in recipients. If organizer disagrees/suggests changes, go back to asking participants using 'ask_participant_availability' or 'propose_time_to_participant'.
+*   Final Confirmation: Generate a summary email body and include all participants+organizer in recipients.
+*   No Action: If the email is just a thank you or doesn't require a scheduling action, use 'no_action_needed' with empty recipients/body.
+*   Error: If scheduling is impossible or request is invalid, use 'error_cannot_schedule'.
+
+IMPORTANT EMAIL BODY RULES:
+*   The 'email_body' field should contain ONLY the text for the email body.
+*   Do NOT include greetings like "Hi [Name]," unless the 'recipients' array contains exactly ONE email address.
+*   Do NOT include subject lines.
+*   Be clear, concise, and professional.`;
 
 // Helper function to map DB message types to AI CoreMessage roles
 function mapDbMessageToCoreMessage(dbMessage: { message_type: string; body_text: string | null }): CoreMessage | null {
@@ -82,6 +116,7 @@ async function sendSchedulingEmail({
 }
 
 export async function POST(req: Request) {
+  console.log("\n--- /api/schedule POST endpoint hit ---"); // ADDED FOR DEBUGGING
   let postmarkPayload: InboundMessageDetails;
   try {
     // Use the actual Postmark InboundMessage type for parsing
@@ -269,81 +304,64 @@ export async function POST(req: Request) {
     }
 
     // 4. Format current email for AI and construct full message list
+    // Explicitly include identified participants in the context for the AI
     const currentMessageContent = `Received email:
 From: ${senderEmail}
 Subject: ${subject}
+Participants involved in this request: ${sessionParticipants.join(', ') || 'None identified'}
 
+Email Body:
 ${textBody}`;
 
     const messagesForAI: CoreMessage[] = [
-      { role: 'system', content: systemMessage },
+      // System message is now part of generateObject call
       ...conversationHistory,
-      { role: 'user', content: currentMessageContent },
+      { role: 'user', content: currentMessageContent }, // Pass enriched context
     ];
+    console.log(`Sending ${messagesForAI.length} messages to AI (excluding system prompt).`);
 
     // 5. Call AI and get stream
-    const { text: aiResponseText, usage } = await generateText({
+    console.log("Calling generateObject...");
+    const { object: aiDecision, usage } = await generateObject({
       model: openai('gpt-4o'),
+      schema: schedulingDecisionSchema,
+      system: systemMessage, // Pass the enhanced system prompt here
       messages: messagesForAI,
     });
     console.log("AI Usage:", usage);
-    console.log("AI Raw Response:", aiResponseText);
+    console.log("AI Decision Object:", JSON.stringify(aiDecision, null, 2));
 
     // 6. Determine Recipients and Send Email via Postmark
-    let recipients: string[] = [];
-    let outgoingMessageId: string | null = null; // Store the outgoing message ID
+    let outgoingMessageId: string | null = null;
 
-    if (aiResponseText && aiResponseText.trim().length > 0) {
-      if (incomingMessageType === 'human_organizer') {
-        // Organizer sent -> Reply goes to Participants
-        recipients = sessionParticipants.filter((p: string) => p !== sessionOrganizer); // Exclude organizer if they were in participants list
-      } else {
-        // Participant sent -> Reply goes to Organizer and *other* Participants
-        recipients = [
-            ...(sessionOrganizer ? [sessionOrganizer] : []),
-            ...sessionParticipants.filter((p: string) => p !== senderEmail && p !== sessionOrganizer)
-        ];
-      }
-      // Remove duplicates just in case
-      recipients = [...new Set(recipients)];
+    if (aiDecision.next_step !== 'no_action_needed' && aiDecision.next_step !== 'error_cannot_schedule' && aiDecision.recipients && aiDecision.recipients.length > 0 && aiDecision.email_body && aiDecision.email_body.trim().length > 0) {
+      console.log(`AI decided next step: ${aiDecision.next_step}. Sending email to: ${aiDecision.recipients.join(', ')}`);
+      const outgoingSubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
+      outgoingMessageId = await sendSchedulingEmail({
+        to: aiDecision.recipients,
+        subject: outgoingSubject,
+        textBody: aiDecision.email_body,
+        replyToMessageId: initialMessageIdForThread,
+        referencesMessageId: messageId
+      });
 
-      if (recipients.length > 0) {
-            console.log(`Determined recipients for AI response: ${recipients.join(', ')}`);
-            const outgoingSubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
-            // Call send function and store the returned message ID
-            outgoingMessageId = await sendSchedulingEmail({
-                to: recipients,
-                subject: outgoingSubject,
-                textBody: aiResponseText,
-                replyToMessageId: initialMessageIdForThread, // Base thread ID
-                referencesMessageId: messageId // ID of the message we are directly replying to
-            });
+      // 7. Save AI response AFTER attempting to send email
+      console.log("Saving AI response to DB.");
+      const { error: aiSaveError } = await supabase
+        .from('session_messages')
+        .insert({
+          session_id: sessionId,
+          postmark_message_id: outgoingMessageId || null,
+          sender_email: process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com',
+          recipient_email: aiDecision.recipients.join(', ') || null,
+          subject: outgoingSubject,
+          body_text: aiDecision.email_body,
+          message_type: 'ai_agent',
+          // Use `any` as a last resort to bypass persistent TS error
+          in_reply_to_message_id: messageId as any,
+        });
 
-            // 7. Save AI response AFTER attempting to send email
-            const { error: aiSaveError } = await supabase
-            .from('session_messages')
-            .insert({
-                session_id: sessionId,
-                postmark_message_id: outgoingMessageId || null,
-                sender_email: process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com',
-                recipient_email: recipients.join(', ') || null,
-                subject: outgoingSubject,
-                body_text: aiResponseText,
-                message_type: 'ai_agent',
-                // Use `any` as a last resort to bypass persistent TS error
-                in_reply_to_message_id: messageId as any,
-            });
-
-            if (aiSaveError) console.error('Supabase error saving AI message:', aiSaveError);
-
-      } else {
-          console.log("AI generated a response, but no recipients determined. Skipping email send.");
-          // Save AI response anyway? Or only save if sent?
-           const { error: aiSaveError } = await supabase
-                .from('session_messages')
-                .insert({ session_id: sessionId, sender_email: 'ai_agent', body_text: aiResponseText, message_type: 'ai_agent' }); // Minimal save
-           if (aiSaveError) console.error('Supabase error saving unsent AI message:', aiSaveError);
-      }
+      if (aiSaveError) console.error('Supabase error saving AI message:', aiSaveError);
 
     } else {
       console.warn('AI generated an empty response. No email sent, not saving AI message.');
@@ -352,7 +370,7 @@ ${textBody}`;
     // 8. Return the stream response immediately
     console.log("Processing complete, returning 200 OK to Postmark.");
     // Return simple success; Postmark doesn't need the AI response content back.
-    return NextResponse.json({ status: 'success' }, { status: 200 });
+    return NextResponse.json({ status: 'success', decision: aiDecision }, { status: 200 });
 
   } catch (error) {
     console.error("Unhandled error in /api/schedule:", error);

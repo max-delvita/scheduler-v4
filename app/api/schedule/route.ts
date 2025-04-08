@@ -139,6 +139,14 @@ export async function POST(req: Request) {
   const messageId = postmarkPayload.MessageID;
   const agentEmail = (process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com').toLowerCase();
 
+  // --- Pre-check: Ensure essential sender info exists --- 
+  if (!senderEmail || typeof senderEmail !== 'string') {
+      // Log a warning, but return 200 OK so Postmark's webhook check passes.
+      // Real emails should always have sender info.
+      console.warn("Payload missing sender email. Assuming test ping or invalid data. Payload:", postmarkPayload);
+      return NextResponse.json({ status: 'ignored_missing_sender' }, { status: 200 }); 
+  }
+
   const findHeader = (name: string): string | undefined => {
       return postmarkPayload.Headers?.find((h: Header) => h.Name.toLowerCase() === name.toLowerCase())?.Value;
   }
@@ -298,8 +306,16 @@ export async function POST(req: Request) {
          }
 
          sessionParticipants = [...new Set(potentialParticipants)]
-             .filter(email => email.toLowerCase() !== senderEmail.toLowerCase() && email.toLowerCase() !== agentEmail);
-         console.log(`Identified Participants (from To/Cc, excluding sender/agent): ${sessionParticipants.join(', ') || 'None'}`);
+             // Filter out sender AND agent (base AND specific hash addresses)
+             .filter(email => {
+                 const lcEmail = email.toLowerCase();
+                 const isSender = lcEmail === senderEmail.toLowerCase();
+                 const isAgentBase = lcEmail === agentEmail;
+                 // Check if email matches the agent's hash pattern (e.g., amy+...@...)         
+                 const isAgentHashed = lcEmail.startsWith(agentEmail.split('@')[0] + '+') && lcEmail.endsWith('@' + agentEmail.split('@')[1]);
+                 return !isSender && !isAgentBase && !isAgentHashed;
+             });
+         console.log(`Identified Participants (from To/Cc, excluding sender/agent/hash): ${sessionParticipants.join(', ') || 'None'}`);
 
          if (sessionParticipants.length === 0) {
               console.log("No participants found in To/Cc, attempting regex fallback on body...");
@@ -389,7 +405,11 @@ ${textBody}`;
     let outgoingMessageId: string | null = null;
     const { next_step, recipients: aiSuggestedRecipients, email_body } = aiDecision;
     let finalRecipients: string[] = [];
+    const agentEmail = (process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com').toLowerCase();
+    const agentBase = agentEmail.split('@')[0];
+    const agentDomain = agentEmail.split('@')[1];
 
+    // Determine recipients based on the *AI's chosen next_step* and *session data*
     if (next_step === 'ask_participant_availability' || next_step === 'propose_time_to_participant') {
         finalRecipients = aiSuggestedRecipients || [];
          console.log(`Step requires emailing participant(s). Using AI recipients: ${finalRecipients.join(', ')}`);
@@ -412,6 +432,14 @@ ${textBody}`;
         console.log(`Step is ${next_step}. No email recipients.`);
         finalRecipients = [];
     }
+
+    // Safeguard: Filter out agent's own addresses (base and hashed) from the final list
+    finalRecipients = finalRecipients.filter(email => {
+        const lcEmail = email.toLowerCase();
+        const isAgentBase = lcEmail === agentEmail;
+        const isAgentHashed = lcEmail.startsWith(agentBase + '+') && lcEmail.endsWith('@' + agentDomain);
+        return !isAgentBase && !isAgentHashed;
+    });
 
     // --- Send Email if needed --- 
     if (finalRecipients.length > 0 && email_body && email_body.trim().length > 0) {

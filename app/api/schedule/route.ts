@@ -722,6 +722,7 @@ export async function POST(req: Request) {
          .from('scheduling_sessions')
          .insert({
            organizer_email: senderEmail,
+           organizer_name: senderName,
            meeting_topic: subject,
            status: 'pending_participant_response', // Initial status
            participant_status_details: initialParticipantStatus,
@@ -732,7 +733,7 @@ export async function POST(req: Request) {
            meeting_location: detectMeetingLocation(textBody).location,
            is_virtual: detectMeetingLocation(textBody).isVirtual,
          })
-         .select('session_id, organizer_email, participants') // Select needed fields
+         .select('session_id, organizer_email, participants, organizer_name') // Select needed fields, including name
          .single();
 
        if (newSessionError) {
@@ -741,6 +742,7 @@ export async function POST(req: Request) {
        }
        sessionId = newSession.session_id;
        sessionOrganizer = newSession.organizer_email;
+       let sessionOrganizerName = newSession.organizer_name;
        sessionParticipants = newSession.participants || []; // Keep this for now?
        conversationHistory = [];
        initialMessageIdForThread = actualMessageIdHeaderValue || null;
@@ -756,7 +758,7 @@ export async function POST(req: Request) {
      // --- Fetch current session state including participant statuses ---
     const { data: currentSessionState, error: stateFetchError } = await supabase
         .from('scheduling_sessions')
-        .select('status, participant_status_details, organizer_email, participants') // Fetch necessary fields
+        .select('status, participant_status_details, organizer_email, participants, organizer_name') // Fetch organizer_name
         .eq('session_id', sessionId)
         .single();
 
@@ -767,6 +769,7 @@ export async function POST(req: Request) {
 
     // Update organizer/participant variables from fetched state if they were not set during session creation/lookup
     sessionOrganizer = currentSessionState.organizer_email;
+    let sessionOrganizerName = currentSessionState.organizer_name;
     sessionParticipants = currentSessionState.participants || []; // Keep using this list?
     let participantDetails: ParticipantStatusDetail[] = currentSessionState.participant_status_details || [];
 
@@ -852,6 +855,15 @@ export async function POST(req: Request) {
     // --- If Organizer Reply or All Participants Replied, Proceed to AI ---
     console.log("Proceeding to prepare for AI call...");
 
+    // --- Helper function to extract and capitalize name from email ---
+    const getNameFromEmail = (email: string | null): string => {
+      if (!email) return 'there'; // Default if email is missing
+      const namePart = email.split('@')[0];
+      // Basic capitalization, handles simple cases like 'john.doe' -> 'John.doe'
+      // More complex logic could be added if needed (e.g., removing numbers, dots)
+      return namePart.charAt(0).toUpperCase() + namePart.slice(1);
+    };
+
     // Reload history INCLUDING the message just saved
     const { data: historyMessages, error: historyError } = await supabase
         .from('session_messages')
@@ -876,16 +888,18 @@ export async function POST(req: Request) {
     // ... Fetch session details (like organizer_timezone, participant_timezones etc.) ...
      const { data: sessionDetailsForAI } = await supabase
       .from('scheduling_sessions')
-      .select('organizer_timezone, participant_timezones, meeting_duration, meeting_location, is_virtual')
+      .select('organizer_timezone, participant_timezones, meeting_duration, meeting_location, is_virtual, organizer_name') // Fetch organizer_name
       .eq('session_id', sessionId)
       .single();
 
      if (sessionDetailsForAI) {
+         // Use fetched name if available, otherwise fallback to extraction
+         sessionOrganizerName = sessionDetailsForAI.organizer_name || getNameFromEmail(sessionOrganizer);
          // ... (existing logic to build timeZoneContext and meetingDetailsContext) ...
            // Process time zones
       let timeZones = [];
       if (sessionDetailsForAI.organizer_timezone) {
-        timeZones.push(`${sessionOrganizer} (Organizer): ${sessionDetailsForAI.organizer_timezone}`);
+        timeZones.push(`${sessionOrganizerName || sessionOrganizer} (Organizer): ${sessionDetailsForAI.organizer_timezone}`);
       }
       if (sessionDetailsForAI.participant_timezones) {
         // Assuming participant_timezones is still stored separately? If not, extract from participantDetails
@@ -915,17 +929,23 @@ export async function POST(req: Request) {
      }
 
 
-     const aiSystemMessage = systemMessage; // Use the global systemMessage constant
+    const aiSystemMessage = systemMessage; // Use the global systemMessage constant
 
-     // Add participant status context for the AI? Optional, but could be helpful.
-     const participantStatusContext = `\\n\\nParticipant Status:\\n${participantDetails.map((p: ParticipantStatusDetail) => `- ${p.email}: ${p.status}`).join('\\n')}`;
+    const organizerName = sessionOrganizerName;
+    const participantNames = participantDetails.map(p => getNameFromEmail(p.email));
+
+    // Add participant status context for the AI? Optional, but could be helpful.
+    const participantStatusContext = `\\n\\nParticipant Status:\\n${participantDetails.map((p: ParticipantStatusDetail) => `- ${getNameFromEmail(p.email)} (${p.email}): ${p.status}`).join('\\n')}`;
+
+    // Add organizer name to the context
+    const nameContext = `\\n\\nKey People:\\nOrganizer: ${organizerName} (${sessionOrganizer || 'Unknown'})\\nParticipants: ${participantNames.join(', ')}`;
 
 
     const messagesForAI: CoreMessage[] = [
         // System prompt is passed separately
         ...conversationHistory, // Ensure this includes the latest message
         // Add context explicitly here instead of relying on the last message content variable
-        { role: 'user', content: `Session Context:${timeZoneContext}${meetingDetailsContext}${participantStatusContext}` } // Add context as a separate user message?
+        { role: 'user', content: `Session Context:${nameContext}${timeZoneContext}${meetingDetailsContext}${participantStatusContext}` } // Add name context
     ];
     console.log(`Sending ${messagesForAI.length} messages to AI (excluding system prompt). Last message should be context.`);
     // --- Call AI using generateObject ---

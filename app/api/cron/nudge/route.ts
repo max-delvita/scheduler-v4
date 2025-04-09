@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { supabase } from '../../../../lib/supabaseClient';
 import { sendSchedulingEmail } from '../../../../lib/emailUtils';
+import { Langfuse } from "langfuse";
 
 // Define participant status detail type (Duplicate from schedule route - consider sharing types)
 interface ParticipantStatusDetail {
@@ -13,6 +14,12 @@ interface ParticipantStatusDetail {
 const NUDGE1_THRESHOLD_MINUTES = 1; // Time after last_request_sent_at to send nudge 1
 const NUDGE2_THRESHOLD_MINUTES = 2; // Time after last_request_sent_at to send nudge 2
 const ESCALATION_THRESHOLD_MINUTES = 3; // Time after last_request_sent_at to escalate
+
+const langfuse = new Langfuse({
+  secretKey: process.env.LANGFUSE_SECRET_KEY,
+  publicKey: process.env.LANGFUSE_PUBLIC_KEY,
+  baseUrl: process.env.LANGFUSE_BASEURL
+});
 
 export async function GET(request: Request) {
   console.log('\n--- /api/cron/nudge GET endpoint hit ---');
@@ -143,5 +150,7 @@ export async function GET(request: Request) {
     console.error("Cron: Unhandled error in nudge job:", error);
     const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
     return NextResponse.json({ error: 'Internal Server Error', details: errorMessage }, { status: 500 });
+  } finally {
+    await langfuse.shutdown();
   }
 } 

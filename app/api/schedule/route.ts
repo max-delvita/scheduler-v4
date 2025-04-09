@@ -6,9 +6,17 @@ import { postmarkClient } from '@/lib/postmarkClient'; // Import Postmark client
 import { NextResponse } from 'next/server'; // Use NextResponse for standard JSON responses
 import type { MessageSendingResponse, Header } from 'postmark/dist/client/models'; // Adjusted imports
 import type { InboundMessageDetails } from 'postmark/dist/client/models/messages/InboundMessage'; // Import Postmark Inbound type
+import { sendSchedulingEmail } from '../../../lib/emailUtils'; // Import the refactored function
 
 // Allow streaming responses up to 30 seconds
 export const maxDuration = 30;
+
+// Define participant status detail type
+interface ParticipantStatusDetail {
+  email: string;
+  status: string; // e.g., 'pending', 'received', 'nudged_1', 'nudged_2', 'timed_out'
+  last_request_sent_at: string | null; // ISO string
+}
 
 // Helper function to detect time zone information in email content
 function detectTimeZone(emailBody: string, senderEmail: string): string | null {
@@ -271,6 +279,7 @@ Follow these steps:
 Workflow Stages & 'next_step' values:
 *   Initial Request Received (often CC'd): When a new meeting request is received, your FIRST action should ALWAYS be to contact the PARTICIPANTS (not the organizer) to collect their availability. The participants' emails are listed in the "Participants involved in this session" field of the user message. Set 'next_step' to 'ask_participant_availability' and set 'recipients' to contain ONLY the participant emails (never include the organizer at this stage). Only use 'request_clarification' (emailing the organizer) if the meeting's purpose is completely unclear OR if no participants could be identified.
 *   Receiving Availability: Analyzing the sender's response (using their name if available, e.g., "Bob mentioned he is available..."). If more participants need checking, use 'ask_participant_availability' or 'propose_time_to_participant' for the *next* participant listed in the session. If all participants responded, use 'propose_time_to_organizer' and email *only* the organizer with proposed time(s), clearly stating who suggested which times (e.g., "Bob suggested Tuesday at 4pm.").
+    When asked to propose times after receiving availability from multiple participants (identified by their separate messages in the history), analyze *all* their responses together. Identify time slots where *everyone* is available. Propose only these common slots to the organizer using 'propose_time_to_organizer'. If no common slots are found, state this clearly and summarize the individual availabilities.
 *   Organizer Confirmation: If organizer agrees, use 'send_final_confirmation' and include *all* participants and the organizer in recipients. If organizer disagrees/suggests changes (e.g., proposes a new time), use 'propose_time_to_participant' to relay the organizer's new suggestion to the participant(s). Only use 'ask_participant_availability' if the organizer rejects the time but doesn't offer a specific alternative.
 *   Final Confirmation: Generate a summary email body and include all participants+organizer in recipients.
 *   No Action: If the email is just a thank you or doesn't require a scheduling action, use 'no_action_needed' with empty recipients/body.
@@ -438,135 +447,6 @@ function mapDbMessageToCoreMessage(dbMessage: { message_type: string; body_text:
       return { role: 'assistant', content: dbMessage.body_text };
     default:
       return null; // Ignore unknown types
-  }
-}
-
-// Helper function to send email via Postmark
-async function sendSchedulingEmail({
-  to,
-  subject,
-  textBody,
-  sessionId, // Add sessionId to construct Reply-To
-  triggeringMessageId, // ID of the email this one is replying to
-  triggeringReferencesHeader, // References header from the triggering email
-  sendAsGroup, // Flag to indicate if this should be sent as a single group email
-}: {
-  to: string | string[];
-  subject: string;
-  textBody: string;
-  sessionId: string; // Make sessionId required for sending
-  triggeringMessageId: string; // The MessageID of the email that triggered this send action
-  triggeringReferencesHeader: string | null; // The References header value from the triggering email
-  sendAsGroup: boolean; // Added parameter
-}): Promise<string | null> {
-  const baseFromAddress = process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com';
-  if (baseFromAddress === 'scheduler@yourdomain.com') {
-      console.warn("POSTMARK_SENDER_ADDRESS environment variable not set, using default.");
-  }
-
-  // Construct the unique Reply-To address using Mailbox Hash strategy
-  const replyToAddress = `${baseFromAddress.split('@')[0]}+${sessionId}@${baseFromAddress.split('@')[1]}`;
-  console.log(`Setting Reply-To: ${replyToAddress}`);
-
-  // --- Construct Threading Headers ---
-  const postmarkHeaders: Header[] = [];
-  const triggerIdFormatted = `<${triggeringMessageId}>`;
-
-  // Set In-Reply-To to the triggering message ID
-  postmarkHeaders.push({ Name: 'In-Reply-To', Value: triggerIdFormatted });
-  console.log(`Setting In-Reply-To: ${triggerIdFormatted}`);
-
-  // Construct References: Start with existing references, then add the triggering ID if not present
-  let refs = triggeringReferencesHeader || ''; // Start with existing refs (can be null/empty)
-  if (!refs.includes(triggerIdFormatted)) {
-    if (refs) refs += ' '; // Add space if appending to existing refs
-    refs += triggerIdFormatted;
-  }
-
-  if (refs) {
-    postmarkHeaders.push({ Name: 'References', Value: refs.trim() });
-    console.log(`Setting References: ${refs.trim()}`);
-  } else {
-    // If there were no original references, the References header is just the In-Reply-To value
-    postmarkHeaders.push({ Name: 'References', Value: triggerIdFormatted });
-     console.log(`Setting References (initial): ${triggerIdFormatted}`);
-  }
-  
-  // --- Add headers to prevent CC visibility and reply-all behavior ---
-
-  // Determine how to handle the 'to' address based on sendAsGroup flag
-  let firstRecipient: string;
-  let remainingRecipients: string[] = [];
-  let postmarkToField: string;
-  const isMultipleRecipients = Array.isArray(to) && to.length > 1;
-
-  if (Array.isArray(to)) {
-    firstRecipient = to[0];
-    remainingRecipients = to.slice(1);
-  } else {
-    firstRecipient = to;
-  }
-
-  if (isMultipleRecipients && sendAsGroup) {
-    // Send as one email to everyone
-    console.log(`Group email requested. Sending to all ${to.length} recipients in one email.`);
-    postmarkToField = to.join(', '); // Join all recipients for the To field
-    remainingRecipients = []; // No individual follow-up emails needed
-     // Add headers to prevent reply-all if it's a group message not intended for reply-all (e.g. notifications)
-     // This might need adjustment based on specific use cases for group emails.
-     // For final confirmation, we likely WANT reply-all.
-  } else {
-    // Send individually (or it's just one recipient anyway)
-    console.log(`Individual email sending logic. First recipient: ${firstRecipient}`);
-    postmarkToField = firstRecipient; // Send first email only to the first recipient
-    // remainingRecipients is already correctly set to handle the loop later
-    // Add headers to inform email clients not to show reply-all options for individual sends
-    postmarkHeaders.push({ Name: 'X-PM-Tag', Value: 'individual-recipient' });
-  }
-
-  // Add an explicit instruction in the email if multiple recipients were going to be included but sent individually
-  let modifiedTextBody = textBody;
-  // This check might need refinement - maybe add instruction only if !sendAsGroup?
-  if (isMultipleRecipients && !sendAsGroup && !textBody.includes("Please reply directly to me only")) {
-    modifiedTextBody = textBody + "\n\nPlease reply directly to me only.";
-  }
-  
-  // --- End Email Privacy Logic ---
-
-  try {
-    console.log(`Attempting to send email via Postmark to: ${postmarkToField}`);
-    const response: MessageSendingResponse = await postmarkClient.sendEmail({
-      From: baseFromAddress, // Send from the base address
-      To: postmarkToField, // Use the determined To field value
-      Subject: subject,
-      TextBody: modifiedTextBody,
-      ReplyTo: replyToAddress, // Set the custom Reply-To header
-      MessageStream: 'outbound',
-      Headers: postmarkHeaders.length > 0 ? postmarkHeaders : undefined,
-    });
-    console.log('Postmark email sent successfully:', response.MessageID);
-    
-    // If we have remaining recipients (meaning !sendAsGroup and original 'to' was array > 1), send individual emails
-    if (remainingRecipients.length > 0) {
-      // Use the same headers as the first email, including threading and individual tag
-      for (const recipient of remainingRecipients) {
-        console.log(`Sending individual email to additional recipient: ${recipient}`);
-        await postmarkClient.sendEmail({
-          From: baseFromAddress,
-          To: recipient, // Send to the individual recipient
-          Subject: subject,
-          TextBody: modifiedTextBody, // Use the potentially modified body
-          ReplyTo: replyToAddress,
-          MessageStream: 'outbound',
-          Headers: postmarkHeaders.length > 0 ? postmarkHeaders : undefined,
-        });
-      }
-    }
-    
-    return response.MessageID;
-  } catch (error) {
-    console.error('Postmark send error:', error);
-    return null;
   }
 }
 
@@ -823,20 +703,28 @@ export async function POST(req: Request) {
               console.log(`Regex Fallback Participants: ${sessionParticipants.join(', ') || 'None'}`);
          }
 
+         // Initialize participant status details
+         const initialParticipantStatus = sessionParticipants.map((email): ParticipantStatusDetail => ({
+            email: email,
+            status: 'pending', // Initial status
+            last_request_sent_at: null // No request sent yet
+         }));
+
        const { data: newSession, error: newSessionError } = await supabase
          .from('scheduling_sessions')
          .insert({
            organizer_email: senderEmail,
            meeting_topic: subject,
-           status: 'pending',
+           session_status: 'pending_participant_response', // Initial session status
+           participant_status_details: initialParticipantStatus, // Store participant statuses
            webhook_target_address: recipientEmail || 'unknown',
-           participants: sessionParticipants,
-           organizer_timezone: detectTimeZone(textBody, senderEmail) || headerTimezone, // Use header timezone as fallback
-           meeting_duration: detectMeetingDuration(textBody), // Add meeting duration
-           meeting_location: detectMeetingLocation(textBody).location, // Add meeting location
-           is_virtual: detectMeetingLocation(textBody).isVirtual, // Add whether meeting is virtual
+           participants: sessionParticipants, // Still store the simple list for quick reference? Maybe remove if participant_status_details is primary.
+           organizer_timezone: detectTimeZone(textBody, senderEmail) || headerTimezone,
+           meeting_duration: detectMeetingDuration(textBody),
+           meeting_location: detectMeetingLocation(textBody).location,
+           is_virtual: detectMeetingLocation(textBody).isVirtual,
          })
-         .select('session_id, organizer_email, participants')
+         .select('session_id, organizer_email, participants') // Select needed fields
          .single();
 
        if (newSessionError) {
@@ -845,100 +733,42 @@ export async function POST(req: Request) {
        }
        sessionId = newSession.session_id;
        sessionOrganizer = newSession.organizer_email;
-       sessionParticipants = newSession.participants || [];
+       sessionParticipants = newSession.participants || []; // Keep this for now?
        conversationHistory = [];
-       initialMessageIdForThread = actualMessageIdHeaderValue || null; 
+       initialMessageIdForThread = actualMessageIdHeaderValue || null;
        console.log(`Created new session: ${sessionId}`);
     }
 
-    // --- Guard: Ensure we have a valid sessionId now --- 
+    // --- Guard: Ensure we have a valid sessionId now ---
     if (!sessionId) {
         console.error("Failed to obtain a valid session ID after all checks.");
         return NextResponse.json({ error: 'Failed to process scheduling session' }, { status: 200 });
     }
 
-    // --- Save Incoming Message (Ensure in_reply_to uses cleaned ID) --- 
+     // --- Fetch current session state including participant statuses ---
+    const { data: currentSessionState, error: stateFetchError } = await supabase
+        .from('scheduling_sessions')
+        .select('session_status, participant_status_details, organizer_email, participants') // Fetch necessary fields
+        .eq('session_id', sessionId)
+        .single();
+
+    if (stateFetchError || !currentSessionState) {
+        console.error('Supabase error fetching current session state:', stateFetchError);
+        return NextResponse.json({ error: 'Failed to fetch session state' }, { status: 200 });
+    }
+
+    // Update organizer/participant variables from fetched state if they were not set during session creation/lookup
+    sessionOrganizer = currentSessionState.organizer_email;
+    sessionParticipants = currentSessionState.participants || []; // Keep using this list?
+    let participantDetails: ParticipantStatusDetail[] = currentSessionState.participant_status_details || [];
+
+    // --- Determine Message Type ---
     const incomingMessageType =
       sessionOrganizer && senderEmail === sessionOrganizer
         ? 'human_organizer'
         : 'human_participant';
-    
-    // If this is a participant response, check for timezone information
-    if (incomingMessageType === 'human_participant') {
-      // Try body content first, then headers
-      const participantTimezone = detectTimeZone(textBody, senderEmail) || headerTimezone;
-      
-      if (participantTimezone) {
-        // Store participant timezone in a JSON field
-        try {
-          // First get existing time zones
-          const { data: existingData, error: fetchError } = await supabase
-            .from('scheduling_sessions')
-            .select('participant_timezones')
-            .eq('session_id', sessionId)
-            .single();
-            
-          if (fetchError) {
-            console.error('Failed to fetch existing timezone data:', fetchError);
-          }
-          
-          // Parse existing data or initialize empty object
-          let existingTimezones: Record<string, string> = {};
-          try {
-            if (existingData?.participant_timezones) {
-              existingTimezones = typeof existingData.participant_timezones === 'string' 
-                ? JSON.parse(existingData.participant_timezones) 
-                : existingData.participant_timezones;
-            }
-          } catch (parseError) {
-            console.error('Error parsing existing timezone data:', parseError);
-          }
-          
-          // Add new timezone
-          existingTimezones[senderEmail] = participantTimezone;
-          
-          // Update in database
-          const { error: tzUpdateError } = await supabase
-            .from('scheduling_sessions')
-            .update({
-              participant_timezones: JSON.stringify(existingTimezones)
-            })
-            .eq('session_id', sessionId);
-            
-          if (tzUpdateError) {
-            console.error('Failed to update participant timezone:', tzUpdateError);
-          } else {
-            console.log(`Updated timezone for participant ${senderEmail}: ${participantTimezone}`);
-            console.log(`Full timezone data: ${JSON.stringify(existingTimezones)}`);
-          }
-        } catch (e) {
-          console.error('Error updating participant timezone:', e);
-        }
-      }
-    } else if (incomingMessageType === 'human_organizer') {
-      // Also check for organizer timezone
-      const organizerTimezone = detectTimeZone(textBody, senderEmail) || headerTimezone;
-      
-      if (organizerTimezone) {
-        try {
-          const { error: tzUpdateError } = await supabase
-            .from('scheduling_sessions')
-            .update({
-              organizer_timezone: organizerTimezone
-            })
-            .eq('session_id', sessionId);
-            
-          if (tzUpdateError) {
-            console.error('Failed to update organizer timezone:', tzUpdateError);
-          } else {
-            console.log(`Updated timezone for organizer ${senderEmail}: ${organizerTimezone}`);
-          }
-        } catch (e) {
-          console.error('Error updating organizer timezone:', e);
-        }
-      }
-    }
-    
+
+    // --- Save Incoming Message (Must happen before logic checks) ---
     console.log(`Saving incoming message as type: ${incomingMessageType}`);
     const { error: insertError } = await supabase.from('session_messages').insert({
         session_id: sessionId,
@@ -948,113 +778,162 @@ export async function POST(req: Request) {
         subject: subject,
         body_text: textBody,
         body_html: htmlBody,
-        // Use the cleaned ID (UUID part) if available from header
         in_reply_to_message_id: inReplyToHeaderRaw?.replace(/[<>]/g, '').split('@')[0] || null,
         message_type: incomingMessageType,
     });
     if (insertError) console.error('Supabase error saving incoming message:', insertError);
     else console.log("Incoming message saved to DB.");
 
-    // --- Prepare for AI (Include explicit participant list) --- 
-    const currentMessageContent = `Received email:
-From: ${senderName} <${senderEmail}>
-Subject: ${subject}
-Participants involved in this session: ${sessionParticipants.join(', ') || 'None listed'}
 
-Email Body:
-${textBody}`;
+    // --- Logic for Participant Replies ---
+    if (incomingMessageType === 'human_participant') {
+        console.log(`Handling reply from participant: ${senderEmail}`);
+        let participantFound = false;
+        let allParticipantsReplied = true; // Assume true initially
 
-    // Debug log to identify potential issue with participant identification
-    console.log('\n--- DEBUG: Participants and Session Info ---');
-    console.log(`Organizer Email: ${sessionOrganizer}`);
-    console.log(`Current Sender Email: ${senderEmail}`);
-    console.log(`Is sender the organizer: ${senderEmail === sessionOrganizer}`);
-    console.log(`Participant Emails: ${sessionParticipants.join(', ') || 'None'}`);
-    console.log('---------------------------------------\n');
+        participantDetails = participantDetails.map((p: ParticipantStatusDetail) => {
+            if (p.email.toLowerCase() === senderEmail.toLowerCase()) {
+                console.log(`Updating status for ${senderEmail} to 'received'`);
+                participantFound = true;
+                return { ...p, status: 'received' };
+            }
+            return p;
+        });
 
-    // Fetch time zone information if available
+        if (!participantFound) {
+            console.warn(`Received email from ${senderEmail} who is not listed in participant_status_details for session ${sessionId}. Ignoring state update.`);
+            // Decide how to handle this - maybe add them? For now, just log and continue.
+        }
+
+        // Check if all participants have replied after the update
+        for (const p of participantDetails) {
+            if (p.status !== 'received') {
+                allParticipantsReplied = false;
+                break;
+            }
+        }
+
+        console.log(`All participants replied check: ${allParticipantsReplied}`);
+
+        // Update the database with the new participant status
+        const { error: statusUpdateError } = await supabase
+            .from('scheduling_sessions')
+            .update({ participant_status_details: participantDetails })
+            .eq('session_id', sessionId);
+
+        if (statusUpdateError) {
+            console.error('Supabase error updating participant status:', statusUpdateError);
+            // Consider how critical this is - maybe still proceed? For now, log and continue.
+        }
+
+        if (!allParticipantsReplied) {
+            console.log(`Session ${sessionId}: Waiting for replies from other participants. No AI action taken.`);
+            // Return success to Postmark, no further action needed for this email
+            return NextResponse.json({ status: 'success_waiting_for_others' }, { status: 200 });
+        } else {
+            console.log(`Session ${sessionId}: All participants have replied. Proceeding to contact organizer.`);
+            // Update session status? Maybe change to 'pending_organizer_confirmation'?
+             await supabase
+               .from('scheduling_sessions')
+               .update({ session_status: 'pending_organizer_confirmation' }) // Update status
+               .eq('session_id', sessionId);
+             // Fall through to call AI below
+        }
+    }
+
+    // --- If Organizer Reply or All Participants Replied, Proceed to AI ---
+    console.log("Proceeding to prepare for AI call...");
+
+    // Reload history INCLUDING the message just saved
+    const { data: historyMessages, error: historyError } = await supabase
+        .from('session_messages')
+        .select('message_type, body_text, postmark_message_id') // Include ID if needed for context?
+        .eq('session_id', sessionId)
+        .order('created_at', { ascending: true });
+
+    if (historyError) {
+       console.error('Supabase error fetching history:', historyError);
+       // Handle error - maybe return?
+    } else if (historyMessages && historyMessages.length > 0) {
+       conversationHistory = historyMessages
+         .map(mapDbMessageToCoreMessage)
+         .filter((msg): msg is CoreMessage => msg !== null);
+       console.log(`Loaded ${conversationHistory.length} history messages for AI.`);
+    }
+
+    // --- Prepare for AI (Timezone/Meeting Details Context) ---
+    // (Keep existing timezone/meeting details context preparation logic here...)
     let timeZoneContext = '';
     let meetingDetailsContext = '';
-    const { data: sessionDetails } = await supabase
+    // ... Fetch session details (like organizer_timezone, participant_timezones etc.) ...
+     const { data: sessionDetailsForAI } = await supabase
       .from('scheduling_sessions')
       .select('organizer_timezone, participant_timezones, meeting_duration, meeting_location, is_virtual')
       .eq('session_id', sessionId)
       .single();
-    
-    if (sessionDetails) {
-      // Process time zones
+
+     if (sessionDetailsForAI) {
+         // ... (existing logic to build timeZoneContext and meetingDetailsContext) ...
+           // Process time zones
       let timeZones = [];
-      
-      if (sessionDetails.organizer_timezone) {
-        timeZones.push(`${sessionOrganizer} (Organizer): ${sessionDetails.organizer_timezone}`);
+      if (sessionDetailsForAI.organizer_timezone) {
+        timeZones.push(`${sessionOrganizer} (Organizer): ${sessionDetailsForAI.organizer_timezone}`);
       }
-      
-      if (sessionDetails.participant_timezones) {
-        const participantTzs = typeof sessionDetails.participant_timezones === 'string' 
-          ? JSON.parse(sessionDetails.participant_timezones) 
-          : sessionDetails.participant_timezones;
-          
+      if (sessionDetailsForAI.participant_timezones) {
+        // Assuming participant_timezones is still stored separately? If not, extract from participantDetails
+         const participantTzs = typeof sessionDetailsForAI.participant_timezones === 'string'
+          ? JSON.parse(sessionDetailsForAI.participant_timezones)
+          : sessionDetailsForAI.participant_timezones;
         for (const [email, tz] of Object.entries(participantTzs)) {
           timeZones.push(`${email}: ${tz}`);
         }
       }
-      
       if (timeZones.length > 0) {
-        timeZoneContext = `\n\nKnown Time Zones:\n${timeZones.join('\n')}`;
+        timeZoneContext = `\\n\\nKnown Time Zones:\\n${timeZones.join('\\n')}`;
       }
-      
+
       // Process meeting details
       let meetingDetails = [];
-      
-      if (sessionDetails.meeting_duration) {
-        meetingDetails.push(`Duration: ${sessionDetails.meeting_duration}`);
+      if (sessionDetailsForAI.meeting_duration) {
+        meetingDetails.push(`Duration: ${sessionDetailsForAI.meeting_duration}`);
       }
-      
-      if (sessionDetails.meeting_location) {
-        const locationType = sessionDetails.is_virtual ? 'Virtual Location' : 'Physical Location';
-        meetingDetails.push(`${locationType}: ${sessionDetails.meeting_location}`);
+      if (sessionDetailsForAI.meeting_location) {
+        const locationType = sessionDetailsForAI.is_virtual ? 'Virtual Location' : 'Physical Location';
+        meetingDetails.push(`${locationType}: ${sessionDetailsForAI.meeting_location}`);
       }
-      
       if (meetingDetails.length > 0) {
-        meetingDetailsContext = `\n\nMeeting Details:\n${meetingDetails.join('\n')}`;
+        meetingDetailsContext = `\\n\\nMeeting Details:\\n${meetingDetails.join('\\n')}`;
       }
-    }
+     }
+
+
+     const aiSystemMessage = systemMessage; // Use the global systemMessage constant
+
+     // Add participant status context for the AI? Optional, but could be helpful.
+     const participantStatusContext = `\\n\\nParticipant Status:\\n${participantDetails.map((p: ParticipantStatusDetail) => `- ${p.email}: ${p.status}`).join('\\n')}`;
+
 
     const messagesForAI: CoreMessage[] = [
-      ...conversationHistory,
-      { role: 'user', content: currentMessageContent + timeZoneContext + meetingDetailsContext },
+        // System prompt is passed separately
+        ...conversationHistory, // Ensure this includes the latest message
+        // Add context explicitly here instead of relying on the last message content variable
+        { role: 'user', content: `Session Context:${timeZoneContext}${meetingDetailsContext}${participantStatusContext}` } // Add context as a separate user message?
     ];
-    console.log(`Sending ${messagesForAI.length} messages to AI (excluding system prompt).`);
-
-    // --- Call AI using generateObject --- 
+    console.log(`Sending ${messagesForAI.length} messages to AI (excluding system prompt). Last message should be context.`);
+    // --- Call AI using generateObject ---
     console.log("Calling generateObject...");
     const { object: aiDecision, usage } = await generateObject({
       model: openai('gpt-4o'),
       schema: schedulingDecisionSchema,
-      system: systemMessage,
+      system: aiSystemMessage, // Use the updated system prompt
       messages: messagesForAI,
     });
     console.log("AI Usage:", usage);
     console.log("AI Decision Object:", JSON.stringify(aiDecision, null, 2));
-    
-    // Enhanced debugging for AI decision-making
-    console.log('\n--- DEBUG: AI Decision Analysis ---');
-    console.log(`Next Step: ${aiDecision.next_step}`);
-    console.log(`AI Suggested Recipients: ${aiDecision.recipients?.join(', ') || 'None'}`);
-    if (aiDecision.next_step === 'ask_participant_availability') {
-      const participantsInRecipients = sessionParticipants.filter(p => 
-        aiDecision.recipients.includes(p)
-      ).length;
-      
-      console.log(`Participants correctly included in recipients: ${participantsInRecipients} of ${sessionParticipants.length}`);
-      
-      const organizerInRecipients = sessionOrganizer && aiDecision.recipients.includes(sessionOrganizer);
-      console.log(`Organizer incorrectly included in recipients: ${organizerInRecipients ? 'YES - ERROR' : 'No - Correct'}`);
-    }
-    console.log('---------------------------------------\n');
 
-    // --- Determine Recipients based on AI Decision & DB Data --- 
-    let outgoingMessageId: string | null = null;
+    // --- Process AI Decision ---
+    // (Existing logic to determine recipients based on next_step)
+     let outgoingMessageId: string | null = null;
     const { next_step, recipients: aiSuggestedRecipients, email_body } = aiDecision;
     let finalRecipients: string[] = [];
     const agentEmail = (process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com').toLowerCase();
@@ -1063,20 +942,40 @@ ${textBody}`;
 
     // Determine recipients based on the *AI's chosen next_step* and *session data*
     if (next_step === 'ask_participant_availability' || next_step === 'propose_time_to_participant') {
-        // SAFEGUARD: For initial availability requests, ensure we only email participants (never the organizer)
-        if (next_step === 'ask_participant_availability' && conversationHistory.length === 0) {
-            // This is the first message in this session - make sure we only contact participants
-            finalRecipients = sessionParticipants.filter(email => 
-                email !== sessionOrganizer && // Never include organizer
-                (!aiSuggestedRecipients || aiSuggestedRecipients.includes(email)) // Respect AI's participant selection if provided
-            );
-            console.log(`SAFEGUARD: First message - ensuring only participants are contacted: ${finalRecipients.join(', ')}`);
-        } else {
-            // Normal case - use AI's selection but ensure we're not CCing anyone
-            // Only send to the specific recipient that AI intended
-            finalRecipients = aiSuggestedRecipients || [];
-            console.log(`Step requires emailing participant(s). Using AI recipients: ${finalRecipients.join(', ')}`);
-        }
+         finalRecipients = aiSuggestedRecipients || [];
+         // Ensure organizer is not included if asking participants
+         if (sessionOrganizer) {
+            finalRecipients = finalRecipients.filter(r => r.toLowerCase() !== sessionOrganizer?.toLowerCase());
+         }
+         console.log(`Step requires emailing participant(s). Using AI recipients: ${finalRecipients.join(', ')}`);
+
+         // --- Update last_request_sent_at for participants being contacted ---
+         const nowISO = new Date().toISOString();
+         let detailsUpdated = false;
+         const updatedParticipantDetailsForRequest = participantDetails.map((p: ParticipantStatusDetail) => {
+             if (finalRecipients.includes(p.email)) {
+                 console.log(`Updating last_request_sent_at for ${p.email}`);
+                 detailsUpdated = true;
+                 // Also update status back to 'pending' or a 'followup_pending'? Or keep as 'received' if proposing a time?
+                 // Let's assume the nudge logic resets status, so just update timestamp here.
+                 return { ...p, last_request_sent_at: nowISO };
+             }
+             return p;
+         });
+
+         if (detailsUpdated) {
+             const { error: requestTimeUpdateError } = await supabase
+                 .from('scheduling_sessions')
+                 .update({ participant_status_details: updatedParticipantDetailsForRequest })
+                 .eq('session_id', sessionId);
+             if (requestTimeUpdateError) {
+                 console.error('Supabase error updating last_request_sent_at:', requestTimeUpdateError);
+             } else {
+                 // Update local variable for consistency if needed later
+                 participantDetails = updatedParticipantDetailsForRequest;
+             }
+         }
+
     } else if (next_step === 'propose_time_to_organizer' || next_step === 'request_clarification') {
         if (sessionOrganizer) {
             finalRecipients = [sessionOrganizer];
@@ -1086,109 +985,133 @@ ${textBody}`;
             finalRecipients = [];
         }
     } else if (next_step === 'send_final_confirmation') {
-        // Final confirmation is the ONLY case where we want to CC everyone
+        // Final confirmation includes everyone
         const allParties = [
             ...(sessionOrganizer ? [sessionOrganizer] : []),
-            ...sessionParticipants
+            ...(participantDetails.map((p: ParticipantStatusDetail) => p.email)) // Get emails from details
         ];
-        finalRecipients = [...new Set(allParties)];
+        finalRecipients = [...new Set(allParties)]; // Ensure uniqueness
         console.log(`Step requires emailing everyone. Final list: ${finalRecipients.join(', ')}`);
     } else {
         console.log(`Step is ${next_step}. No email recipients.`);
         finalRecipients = [];
     }
 
-    // Safeguard: Filter out agent's own addresses (base and hashed) from the final list
-    finalRecipients = finalRecipients.filter(email => {
+     // Safeguard: Filter out agent's own addresses
+     finalRecipients = finalRecipients.filter(email => {
         const lcEmail = email.toLowerCase();
         const isAgentBase = lcEmail === agentEmail;
         const isAgentHashed = lcEmail.startsWith(agentBase + '+') && lcEmail.endsWith('@' + agentDomain);
         return !isAgentBase && !isAgentHashed;
     });
 
-    // --- Send Email if needed --- 
+
+    // --- Send Email if needed ---
     if (finalRecipients.length > 0 && email_body && email_body.trim().length > 0) {
         console.log(`Final determined recipients: ${finalRecipients.join(', ')}`);
         const outgoingSubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
+
+        // Determine sendAsGroup flag
+        const sendAsGroup = next_step === 'send_final_confirmation';
+
         outgoingMessageId = await sendSchedulingEmail({
             to: finalRecipients,
             subject: outgoingSubject,
             textBody: email_body,
-            sessionId, // Pass session ID for Reply-To construction
-            triggeringMessageId: actualMessageIdHeaderValue, // Pass the *actual* header value
-            triggeringReferencesHeader: referencesHeader || null, // Pass the References from the received email
-            sendAsGroup: next_step === 'send_final_confirmation', // Send as group ONLY for final confirmation
+            sessionId,
+            triggeringMessageId: actualMessageIdHeaderValue,
+            triggeringReferencesHeader: referencesHeader || null,
+            sendAsGroup: sendAsGroup,
         });
-    // --- Save AI Response --- 
-    console.log("Saving AI response to DB.");
-    const { error: aiSaveError } = await supabase
-            .from('session_messages')
-            .insert({
-                session_id: sessionId,
-                postmark_message_id: outgoingMessageId || null,
-                sender_email: process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com',
-                recipient_email: finalRecipients.join(', ') || null,
-                subject: outgoingSubject,
-                body_text: email_body,
-                message_type: 'ai_agent',
-                in_reply_to_message_id: actualMessageIdHeaderValue, // Link to the ID of the triggering email using the *actual* header value
-            });
-    if (aiSaveError) console.error('Supabase error saving AI message:', aiSaveError);
-    else console.log("AI Response saved to DB.");
+
+        // --- Save AI Response ---
+        if (outgoingMessageId) { // Only save if email was sent successfully (got an ID)
+             console.log("Saving AI response to DB.");
+             const { error: aiSaveError } = await supabase
+                .from('session_messages')
+                .insert({
+                    session_id: sessionId,
+                    postmark_message_id: outgoingMessageId,
+                    sender_email: process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com',
+                    recipient_email: finalRecipients.join(', ') || null,
+                    subject: outgoingSubject,
+                    body_text: email_body,
+                    message_type: 'ai_agent',
+                    in_reply_to_message_id: actualMessageIdHeaderValue,
+                });
+             if (aiSaveError) console.error('Supabase error saving AI message:', aiSaveError);
+             else console.log("AI Response saved to DB.");
+        } else {
+             console.error("Failed to send email, AI response not saved to DB.");
+        }
 
     } else {
       console.warn(`AI decided next step: ${next_step}, but no valid recipients/body found. No email sent.`);
     }
 
-    // --- Update Session State and any detected information --- 
-    const sessionUpdateData: Record<string, any> = { current_step: next_step };
-    
-    // Check for duration and location in the latest message
+    // --- Update Session State ---
+    // Determine the next overall session_status based on AI's next_step
+    let nextSessionStatus = currentSessionState.session_status; // Default to current
+    switch(next_step) {
+        case 'ask_participant_availability':
+        case 'propose_time_to_participant':
+            nextSessionStatus = 'pending_participant_response'; // Waiting for participants again
+            break;
+        case 'propose_time_to_organizer':
+        case 'request_clarification':
+            nextSessionStatus = 'pending_organizer_confirmation'; // Waiting for organizer
+            break;
+        case 'send_final_confirmation':
+            nextSessionStatus = 'confirmed';
+            break;
+        case 'error_cannot_schedule':
+            nextSessionStatus = 'error';
+            break;
+        // 'no_action_needed' doesn't change the status from the previous state
+    }
+
+    const sessionUpdateData: Record<string, any> = { session_status: nextSessionStatus }; // Use session_status now
+
+    // (Keep existing logic for updating meeting_duration, meeting_location, confirmed_datetime)
+     // Check for duration and location in the latest message
     const detectedDuration = detectMeetingDuration(textBody);
     if (detectedDuration) {
       sessionUpdateData.meeting_duration = detectedDuration;
     }
-    
     const detectedLocation = detectMeetingLocation(textBody);
     if (detectedLocation.location) {
       sessionUpdateData.meeting_location = detectedLocation.location;
       sessionUpdateData.is_virtual = detectedLocation.isVirtual;
     }
-    
-    // If this is a final confirmation, extract and store the confirmed date/time
-    if (next_step === 'send_final_confirmation') {
-      // First check if the AI provided the confirmed_datetime directly
+     if (next_step === 'send_final_confirmation') {
       if (aiDecision.confirmed_datetime) {
         sessionUpdateData.confirmed_datetime = aiDecision.confirmed_datetime;
-        sessionUpdateData.status = 'confirmed';
-        console.log(`Using AI-provided confirmed date/time: ${aiDecision.confirmed_datetime}`);
       } else {
-        // Otherwise try to extract it from the email body
         const confirmedDateTime = extractConfirmedDateTime(email_body);
         if (confirmedDateTime) {
           sessionUpdateData.confirmed_datetime = confirmedDateTime;
-          sessionUpdateData.status = 'confirmed';
-          console.log(`Extracted confirmed date/time: ${confirmedDateTime}`);
         } else {
           console.log(`Could not extract confirmed date/time from final confirmation email`);
         }
       }
     }
-    
+
     const { error: updateSessionError } = await supabase
       .from('scheduling_sessions')
       .update(sessionUpdateData)
       .eq('session_id', sessionId);
-      
-    if (updateSessionError) console.error('Supabase error updating session info:', updateSessionError);
 
-    // --- Return Success Response to Postmark --- 
+    if (updateSessionError) console.error('Supabase error updating final session info:', updateSessionError);
+
+
+    // --- Return Success Response to Postmark ---
     console.log("Processing complete, returning 200 OK to Postmark.");
     return NextResponse.json({ status: 'success', decision: aiDecision }, { status: 200 });
 
   } catch (error) {
     console.error("Unhandled error in /api/schedule:", error);
     const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
+    // Ensure we still return 200 to Postmark to prevent retries on unhandled errors
     return NextResponse.json({ error: 'Internal Server Error', details: errorMessage }, { status: 200 });
   }
 } 

@@ -196,7 +196,9 @@ function detectMeetingLocation(emailBody: string): { isVirtual: boolean, locatio
   const inPersonPatterns = [
     /(?:in[-\s]person|on[-\s]site|face[-\s]to[-\s]face|in[-\s]office|at\s+(?:the\s+)?office)/i,
     /(?:meeting\s+room|conference\s+room|office\s+space|location\s*:)/i,
-    /(?:address\s*:|building|floor|suite|room\s+\d+|rm\s+\d+)/i
+    /(?:address\s*:|building|floor|suite|room\s+\d+|rm\s+\d+)/i,
+    /(?:grab|have|get|for)\s+(?:a\s+)?(coffee|lunch|drinks?)/i,
+    /meet\s+(?:at|in)\s+(?:my|your|the)\s+office/i
   ];
   
   // Check for specific locations
@@ -340,6 +342,11 @@ MEETING DURATION AND LOCATION:
 *   For in-person meetings, include the full location details when available.
 *   When proposing times, confirm both the time and expected duration.
 *   In the final confirmation, include complete details about duration and location.
+
+*   **Use Location Context:** Refer to the meeting_location and is_virtual status provided in the Session Context when discussing the meeting.
+*   **Clarify Ambiguous Location:** If the location context is missing (e.g., meeting_location is null or just a default like "Virtual" or "In-person (location not specified)") AND you need to propose times or send a final confirmation, your next_step must be 'request_clarification'. Ask the *organizer* to specify if the meeting is virtual or provide the physical location/address.
+*   **Handle Participant Location Query:** If a *participant* asks "Is this virtual or in person?" and the location context is unclear, use 'request_clarification' to ask the *organizer* for clarification before responding to the participant.
+*   **Include Location Details:** When proposing times or sending final confirmations *and the location is known*, always clearly state it (e.g., "Location: Virtual", "Location: 123 Main St", "Location: [Organizer Name]'s Office").
 
 Time Proposal Format: When using 'propose_time_to_organizer', format the email_body like this:
 
@@ -626,7 +633,7 @@ export async function POST(req: Request) {
             .from('scheduling_sessions')
             .select('organizer_email, participants')
             .eq('session_id', sessionId)
-            .maybeSingle(); // Use maybeSingle as hash might be invalid
+            .maybeSingle();
 
         if (sessionDirectErr) {
             console.error('Supabase error fetching session by MailboxHash:', sessionDirectErr);

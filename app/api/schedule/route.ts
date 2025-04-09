@@ -605,7 +605,8 @@ export async function POST(req: Request) {
       // Use sessionId if available, otherwise maybe a unique ID like messageId?
       // Using messageId might create a new trace for every email if session isn't found initially.
       // Consider if upserting based on a derived session identifier is better.
-      id: `schedule-session:${sessionId || messageId}`, 
+      id: `schedule-session:${sessionId || messageId}`, // Keep unique ID for this specific API call
+      sessionId: sessionId ?? undefined, // Add the Supabase session ID here - Langfuse will group traces with the same sessionId
       name: "schedule-request",
       userId: senderEmail, // Associate trace with the sender
       metadata: initialTraceMetadata

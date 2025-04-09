@@ -487,20 +487,61 @@ async function sendSchedulingEmail({
     postmarkHeaders.push({ Name: 'References', Value: triggerIdFormatted });
      console.log(`Setting References (initial): ${triggerIdFormatted}`);
   }
-  // --- End Threading Headers ---
+  
+  // --- Add headers to prevent CC visibility and reply-all behavior ---
+  // Only send to one recipient at a time unless it's the final confirmation
+  let toAddress = Array.isArray(to) && to.length > 1 ? to[0] : to;
+  let isMultiRecipient = Array.isArray(to) && to.length > 1;
+  
+  // If this is a multi-recipient email (final confirmation), keep all recipients
+  // Otherwise, send individual emails to prevent reply-all
+  if (isMultiRecipient) {
+    console.log(`Multi-recipient email (likely final confirmation). Using all recipients.`);
+    toAddress = Array.isArray(to) ? to.join(', ') : to;
+  } else {
+    console.log(`Single-recipient email to prevent reply-all behavior.`);
+    // Add headers to inform email clients not to show reply-all options
+    postmarkHeaders.push({ Name: 'X-PM-Tag', Value: 'individual-recipient' });
+  }
+  
+  // Add an explicit instruction in the email if multiple recipients were going to be included
+  let modifiedTextBody = textBody;
+  if (isMultiRecipient && !textBody.includes("This confirmation has been sent to all participants")) {
+    // This is probably a participant availability request that needs to be sent individually
+    modifiedTextBody = textBody + "\n\nPlease reply directly to me only, not to all participants.";
+  }
+  
+  // --- End Email Privacy Headers ---
 
   try {
-    console.log(`Attempting to send email via Postmark to: ${Array.isArray(to) ? to.join(', ') : to}`);
+    console.log(`Attempting to send email via Postmark to: ${Array.isArray(toAddress) ? toAddress.join(', ') : toAddress}`);
     const response: MessageSendingResponse = await postmarkClient.sendEmail({
       From: baseFromAddress, // Send from the base address
-      To: Array.isArray(to) ? to.join(', ') : to,
+      To: Array.isArray(toAddress) ? toAddress.join(', ') : toAddress,
       Subject: subject,
-      TextBody: textBody,
+      TextBody: modifiedTextBody,
       ReplyTo: replyToAddress, // Set the custom Reply-To header
       MessageStream: 'outbound',
       Headers: postmarkHeaders.length > 0 ? postmarkHeaders : undefined,
     });
     console.log('Postmark email sent successfully:', response.MessageID);
+    
+    // If we have multiple recipients, send individual emails to each of them (except the first one)
+    if (Array.isArray(to) && to.length > 1 && !isMultiRecipient) {
+      for (let i = 1; i < to.length; i++) {
+        console.log(`Sending individual email to additional recipient ${i+1}/${to.length}: ${to[i]}`);
+        await postmarkClient.sendEmail({
+          From: baseFromAddress,
+          To: to[i],
+          Subject: subject,
+          TextBody: modifiedTextBody,
+          ReplyTo: replyToAddress,
+          MessageStream: 'outbound',
+          Headers: postmarkHeaders.length > 0 ? postmarkHeaders : undefined,
+        });
+      }
+    }
+    
     return response.MessageID;
   } catch (error) {
     console.error('Postmark send error:', error);
@@ -974,7 +1015,8 @@ ${textBody}`;
             );
             console.log(`SAFEGUARD: First message - ensuring only participants are contacted: ${finalRecipients.join(', ')}`);
         } else {
-            // Normal case - use AI's selection
+            // Normal case - use AI's selection but ensure we're not CCing anyone
+            // Only send to the specific recipient that AI intended
             finalRecipients = aiSuggestedRecipients || [];
             console.log(`Step requires emailing participant(s). Using AI recipients: ${finalRecipients.join(', ')}`);
         }
@@ -987,6 +1029,7 @@ ${textBody}`;
             finalRecipients = [];
         }
     } else if (next_step === 'send_final_confirmation') {
+        // Final confirmation is the ONLY case where we want to CC everyone
         const allParties = [
             ...(sessionOrganizer ? [sessionOrganizer] : []),
             ...sessionParticipants

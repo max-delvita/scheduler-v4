@@ -24,28 +24,93 @@ function detectTimeZone(emailBody: string, senderEmail: string): string | null {
     // Common abbreviations
     { regex: /\b(?:EST|EDT|PST|PDT|CST|CDT|MST|MDT|AKST|AKDT|HST|AEST|IST|BST|CET|EET|JST|CST)\b/g, extract: (match: string) => match },
     
-    // Time with explicit zone
-    { regex: /\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+([a-z]{3,5})/gi, extract: (match: string, groups: string[]) => groups[0] },
+    // Time with explicit zone - FIX: This regex wasn't extracting the capture group correctly
+    { regex: /\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+([a-z]{3,5})/gi, 
+      extract: (match: string) => {
+        const parts = match.match(/([a-z]{3,5})$/i); // Extract the timezone part only
+        return parts ? match : null;
+      }
+    },
     
-    // Common timezone mentions
-    { regex: /time(?:\s+)?zone(?:\s+)?(?:is|:)?\s+([a-z0-9\/\s\+\-\_]+)/gi, extract: (match: string, groups: string[]) => groups[0]?.trim() }
+    // Common timezone mentions - FIX: This regex wasn't extracting the capture group correctly
+    { regex: /time(?:\s+)?zone(?:\s+)?(?:is|:)?\s+([a-z0-9\/\s\+\-\_]+)/gi, 
+      extract: (match: string) => {
+        const parts = match.split(/time(?:\s+)?zone(?:\s+)?(?:is|:)?\s+/i);
+        return parts && parts.length > 1 ? parts[1].trim() : match;
+      }
+    },
+    
+    // Additional common patterns
+    { regex: /\b(?:in|from)\s+(?:the\s+)?([a-z]{3,5}|[a-z]+\s+(?:standard|daylight|savings)\s+time)\s+(?:time\s+)?zone/gi, 
+      extract: (match: string) => {
+        const parts = match.match(/\b(?:in|from)\s+(?:the\s+)?([a-z]{3,5}|[a-z]+\s+(?:standard|daylight|savings)\s+time)/i);
+        return parts && parts.length > 1 ? parts[1].trim() : match;
+      }
+    }
   ];
+  
+  console.log(`DEBUG: Checking for time zone in email from ${senderEmail}`);
   
   // Try each pattern
   for (const pattern of timezonePatterns) {
     const matches = emailBody.match(pattern.regex);
     if (matches && matches.length > 0) {
       // Return the first match
-      return matches[0];
+      const extracted = pattern.extract(matches[0]);
+      console.log(`DEBUG: Detected time zone: ${extracted} using pattern: ${pattern.regex}`);
+      return extracted;
     }
   }
   
   // Try to extract from common phrases
   if (emailBody.includes("my timezone") || emailBody.includes("my time zone")) {
     const timezoneContext = emailBody.split(/my\s+time(?:\s+)?zone(?:\s+)?(?:is|:)?/i)[1]?.trim().split(/[.,\n]/)[0]?.trim();
-    if (timezoneContext) return timezoneContext;
+    if (timezoneContext) {
+      console.log(`DEBUG: Detected time zone from phrase: ${timezoneContext}`);
+      return timezoneContext;
+    }
   }
   
+  console.log(`DEBUG: No time zone detected in email body from ${senderEmail}`);
+  return null;
+}
+
+// Extract timezone from email headers (typically from the Date header)
+function extractTimezoneFromHeaders(headers: Header[] | undefined): string | null {
+  if (!headers || !Array.isArray(headers)) {
+    console.log("DEBUG: No headers available to extract timezone");
+    return null;
+  }
+  
+  // Find the Date header
+  const dateHeader = headers.find(h => h.Name.toLowerCase() === 'date');
+  if (!dateHeader || !dateHeader.Value) {
+    console.log("DEBUG: No Date header found");
+    return null;
+  }
+  
+  console.log(`DEBUG: Found Date header: ${dateHeader.Value}`);
+  
+  // Extract timezone from date header
+  // Format is typically: "Wed, 25 May 2022 14:56:34 +0000 (UTC)" or similar
+  
+  // Try to extract timezone offset (e.g., +0000, -0700)
+  const offsetMatch = dateHeader.Value.match(/\s([+-]\d{4})\s/);
+  if (offsetMatch && offsetMatch[1]) {
+    const offset = offsetMatch[1];
+    console.log(`DEBUG: Extracted timezone offset from Date header: ${offset}`);
+    return `GMT${offset}`;
+  }
+  
+  // Try to extract timezone abbreviation (e.g., UTC, EST)
+  const tzAbbrevMatch = dateHeader.Value.match(/\([A-Z]{3,5}\)$/);
+  if (tzAbbrevMatch && tzAbbrevMatch[0]) {
+    const tz = tzAbbrevMatch[0].replace(/[()]/g, '');
+    console.log(`DEBUG: Extracted timezone abbreviation from Date header: ${tz}`);
+    return tz;
+  }
+  
+  console.log("DEBUG: Could not extract timezone from Date header");
   return null;
 }
 
@@ -478,6 +543,10 @@ export async function POST(req: Request) {
   const inReplyToHeaderRaw = findHeader('In-Reply-To');
   const referencesHeader = findHeader('References');
 
+  // --- Extract timezone from headers ---
+  const headerTimezone = extractTimezoneFromHeaders(postmarkPayload.Headers);
+  console.log(`Timezone from headers: ${headerTimezone || 'None detected'}`);
+  
   // --- Find the ACTUAL Message-ID header for threading ---
   const rawMessageIdHeader = findHeader('Message-ID');
   // Extract the value *between* the angle brackets < >
@@ -664,7 +733,7 @@ export async function POST(req: Request) {
            status: 'pending',
            webhook_target_address: recipientEmail || 'unknown',
            participants: sessionParticipants,
-           organizer_timezone: detectTimeZone(textBody, senderEmail), // Add organizer timezone
+           organizer_timezone: detectTimeZone(textBody, senderEmail) || headerTimezone, // Use header timezone as fallback
            meeting_duration: detectMeetingDuration(textBody), // Add meeting duration
            meeting_location: detectMeetingLocation(textBody).location, // Add meeting location
            is_virtual: detectMeetingLocation(textBody).isVirtual, // Add whether meeting is virtual
@@ -698,21 +767,43 @@ export async function POST(req: Request) {
     
     // If this is a participant response, check for timezone information
     if (incomingMessageType === 'human_participant') {
-      const participantTimezone = detectTimeZone(textBody, senderEmail);
+      // Try body content first, then headers
+      const participantTimezone = detectTimeZone(textBody, senderEmail) || headerTimezone;
+      
       if (participantTimezone) {
         // Store participant timezone in a JSON field
         try {
+          // First get existing time zones
+          const { data: existingData, error: fetchError } = await supabase
+            .from('scheduling_sessions')
+            .select('participant_timezones')
+            .eq('session_id', sessionId)
+            .single();
+            
+          if (fetchError) {
+            console.error('Failed to fetch existing timezone data:', fetchError);
+          }
+          
+          // Parse existing data or initialize empty object
+          let existingTimezones: Record<string, string> = {};
+          try {
+            if (existingData?.participant_timezones) {
+              existingTimezones = typeof existingData.participant_timezones === 'string' 
+                ? JSON.parse(existingData.participant_timezones) 
+                : existingData.participant_timezones;
+            }
+          } catch (parseError) {
+            console.error('Error parsing existing timezone data:', parseError);
+          }
+          
+          // Add new timezone
+          existingTimezones[senderEmail] = participantTimezone;
+          
+          // Update in database
           const { error: tzUpdateError } = await supabase
             .from('scheduling_sessions')
             .update({
-              participant_timezones: JSON.stringify({ 
-                ...JSON.parse((await supabase
-                  .from('scheduling_sessions')
-                  .select('participant_timezones')
-                  .eq('session_id', sessionId)
-                  .single()).data?.participant_timezones || '{}'),
-                [senderEmail]: participantTimezone
-              })
+              participant_timezones: JSON.stringify(existingTimezones)
             })
             .eq('session_id', sessionId);
             
@@ -720,9 +811,32 @@ export async function POST(req: Request) {
             console.error('Failed to update participant timezone:', tzUpdateError);
           } else {
             console.log(`Updated timezone for participant ${senderEmail}: ${participantTimezone}`);
+            console.log(`Full timezone data: ${JSON.stringify(existingTimezones)}`);
           }
         } catch (e) {
           console.error('Error updating participant timezone:', e);
+        }
+      }
+    } else if (incomingMessageType === 'human_organizer') {
+      // Also check for organizer timezone
+      const organizerTimezone = detectTimeZone(textBody, senderEmail) || headerTimezone;
+      
+      if (organizerTimezone) {
+        try {
+          const { error: tzUpdateError } = await supabase
+            .from('scheduling_sessions')
+            .update({
+              organizer_timezone: organizerTimezone
+            })
+            .eq('session_id', sessionId);
+            
+          if (tzUpdateError) {
+            console.error('Failed to update organizer timezone:', tzUpdateError);
+          } else {
+            console.log(`Updated timezone for organizer ${senderEmail}: ${organizerTimezone}`);
+          }
+        } catch (e) {
+          console.error('Error updating organizer timezone:', e);
         }
       }
     }

@@ -254,7 +254,7 @@ const schedulingDecisionSchema = z.object({
   email_body: z.string().describe("The content of the email body to send to the specified recipients. Should be empty if next_step is 'no_action_needed'. Format as plain text."),
   // Optional fields we might add later:
   // proposed_datetime: z.string().optional().describe("ISO 8601 string if a specific time is being proposed."),
-  // confirmed_datetime: z.string().optional().describe("ISO 8601 string if a time has been confirmed."),
+  confirmed_datetime: z.string().optional().describe("ISO 8601 string if a time has been confirmed."),
 });
 
 // Enhanced System Prompt for Structured Output
@@ -406,6 +406,8 @@ I've sent this confirmation to all participants. If you need to make any changes
 Best regards,
 Amy
 
+IMPORTANT: When using 'send_final_confirmation', you should also set the 'confirmed_datetime' field to an ISO 8601 string (e.g., "2025-04-15T15:00:00Z") representing the confirmed meeting start time. This allows the system to automatically track the confirmed meeting time.
+
 Clarification Request Format: When using 'request_clarification', format the email_body like this:
 
 Hi [Organizer],
@@ -447,6 +449,7 @@ async function sendSchedulingEmail({
   sessionId, // Add sessionId to construct Reply-To
   triggeringMessageId, // ID of the email this one is replying to
   triggeringReferencesHeader, // References header from the triggering email
+  sendAsGroup, // Flag to indicate if this should be sent as a single group email
 }: {
   to: string | string[];
   subject: string;
@@ -454,6 +457,7 @@ async function sendSchedulingEmail({
   sessionId: string; // Make sessionId required for sending
   triggeringMessageId: string; // The MessageID of the email that triggered this send action
   triggeringReferencesHeader: string | null; // The References header value from the triggering email
+  sendAsGroup: boolean; // Added parameter
 }): Promise<string | null> {
   const baseFromAddress = process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com';
   if (baseFromAddress === 'scheduler@yourdomain.com') {
@@ -489,35 +493,51 @@ async function sendSchedulingEmail({
   }
   
   // --- Add headers to prevent CC visibility and reply-all behavior ---
-  // Only send to one recipient at a time unless it's the final confirmation
-  let toAddress = Array.isArray(to) && to.length > 1 ? to[0] : to;
-  let isMultiRecipient = Array.isArray(to) && to.length > 1;
-  
-  // If this is a multi-recipient email (final confirmation), keep all recipients
-  // Otherwise, send individual emails to prevent reply-all
-  if (isMultiRecipient) {
-    console.log(`Multi-recipient email (likely final confirmation). Using all recipients.`);
-    toAddress = Array.isArray(to) ? to.join(', ') : to;
+
+  // Determine how to handle the 'to' address based on sendAsGroup flag
+  let firstRecipient: string;
+  let remainingRecipients: string[] = [];
+  let postmarkToField: string;
+  const isMultipleRecipients = Array.isArray(to) && to.length > 1;
+
+  if (Array.isArray(to)) {
+    firstRecipient = to[0];
+    remainingRecipients = to.slice(1);
   } else {
-    console.log(`Single-recipient email to prevent reply-all behavior.`);
-    // Add headers to inform email clients not to show reply-all options
+    firstRecipient = to;
+  }
+
+  if (isMultipleRecipients && sendAsGroup) {
+    // Send as one email to everyone
+    console.log(`Group email requested. Sending to all ${to.length} recipients in one email.`);
+    postmarkToField = to.join(', '); // Join all recipients for the To field
+    remainingRecipients = []; // No individual follow-up emails needed
+     // Add headers to prevent reply-all if it's a group message not intended for reply-all (e.g. notifications)
+     // This might need adjustment based on specific use cases for group emails.
+     // For final confirmation, we likely WANT reply-all.
+  } else {
+    // Send individually (or it's just one recipient anyway)
+    console.log(`Individual email sending logic. First recipient: ${firstRecipient}`);
+    postmarkToField = firstRecipient; // Send first email only to the first recipient
+    // remainingRecipients is already correctly set to handle the loop later
+    // Add headers to inform email clients not to show reply-all options for individual sends
     postmarkHeaders.push({ Name: 'X-PM-Tag', Value: 'individual-recipient' });
   }
-  
-  // Add an explicit instruction in the email if multiple recipients were going to be included
+
+  // Add an explicit instruction in the email if multiple recipients were going to be included but sent individually
   let modifiedTextBody = textBody;
-  if (isMultiRecipient && !textBody.includes("This confirmation has been sent to all participants")) {
-    // This is probably a participant availability request that needs to be sent individually
-    modifiedTextBody = textBody + "\n\nPlease reply directly to me only, not to all participants.";
+  // This check might need refinement - maybe add instruction only if !sendAsGroup?
+  if (isMultipleRecipients && !sendAsGroup && !textBody.includes("Please reply directly to me only")) {
+    modifiedTextBody = textBody + "\n\nPlease reply directly to me only.";
   }
   
-  // --- End Email Privacy Headers ---
+  // --- End Email Privacy Logic ---
 
   try {
-    console.log(`Attempting to send email via Postmark to: ${Array.isArray(toAddress) ? toAddress.join(', ') : toAddress}`);
+    console.log(`Attempting to send email via Postmark to: ${postmarkToField}`);
     const response: MessageSendingResponse = await postmarkClient.sendEmail({
       From: baseFromAddress, // Send from the base address
-      To: Array.isArray(toAddress) ? toAddress.join(', ') : toAddress,
+      To: postmarkToField, // Use the determined To field value
       Subject: subject,
       TextBody: modifiedTextBody,
       ReplyTo: replyToAddress, // Set the custom Reply-To header
@@ -526,15 +546,16 @@ async function sendSchedulingEmail({
     });
     console.log('Postmark email sent successfully:', response.MessageID);
     
-    // If we have multiple recipients, send individual emails to each of them (except the first one)
-    if (Array.isArray(to) && to.length > 1 && !isMultiRecipient) {
-      for (let i = 1; i < to.length; i++) {
-        console.log(`Sending individual email to additional recipient ${i+1}/${to.length}: ${to[i]}`);
+    // If we have remaining recipients (meaning !sendAsGroup and original 'to' was array > 1), send individual emails
+    if (remainingRecipients.length > 0) {
+      // Use the same headers as the first email, including threading and individual tag
+      for (const recipient of remainingRecipients) {
+        console.log(`Sending individual email to additional recipient: ${recipient}`);
         await postmarkClient.sendEmail({
           From: baseFromAddress,
-          To: to[i],
+          To: recipient, // Send to the individual recipient
           Subject: subject,
-          TextBody: modifiedTextBody,
+          TextBody: modifiedTextBody, // Use the potentially modified body
           ReplyTo: replyToAddress,
           MessageStream: 'outbound',
           Headers: postmarkHeaders.length > 0 ? postmarkHeaders : undefined,
@@ -545,6 +566,42 @@ async function sendSchedulingEmail({
     return response.MessageID;
   } catch (error) {
     console.error('Postmark send error:', error);
+    return null;
+  }
+}
+
+// Helper function to extract meeting date and time from email body
+function extractConfirmedDateTime(emailBody: string): string | null {
+  // Look for the date and time in the final confirmation email format
+  // Format is typically:
+  // Date: Tuesday, April 15, 2025
+  // Time: 3:00 PM - 4:00 PM EST
+  
+  let dateMatch = emailBody.match(/Date:\s*([^\n]+)/);
+  let timeMatch = emailBody.match(/Time:\s*([^\n]+)/);
+  
+  if (!dateMatch || !timeMatch) return null;
+  
+  const dateStr = dateMatch[1].trim();
+  const timeStr = timeMatch[1].trim();
+  
+  console.log(`Extracted date: ${dateStr}, time: ${timeStr}`);
+  
+  try {
+    // Try to parse the date and time into a standardized format
+    // This is a simple implementation - a more robust solution would use a date library
+    const combinedStr = `${dateStr} ${timeStr.split('-')[0].trim()}`;
+    const date = new Date(combinedStr);
+    
+    if (isNaN(date.getTime())) {
+      console.log(`Could not parse date/time: ${combinedStr}`);
+      return null;
+    }
+    
+    // Return in ISO format
+    return date.toISOString();
+  } catch (e) {
+    console.error('Error parsing confirmed date/time:', e);
     return null;
   }
 }
@@ -1060,6 +1117,7 @@ ${textBody}`;
             sessionId, // Pass session ID for Reply-To construction
             triggeringMessageId: actualMessageIdHeaderValue, // Pass the *actual* header value
             triggeringReferencesHeader: referencesHeader || null, // Pass the References from the received email
+            sendAsGroup: next_step === 'send_final_confirmation', // Send as group ONLY for final confirmation
         });
     // --- Save AI Response --- 
     console.log("Saving AI response to DB.");
@@ -1095,6 +1153,26 @@ ${textBody}`;
     if (detectedLocation.location) {
       sessionUpdateData.meeting_location = detectedLocation.location;
       sessionUpdateData.is_virtual = detectedLocation.isVirtual;
+    }
+    
+    // If this is a final confirmation, extract and store the confirmed date/time
+    if (next_step === 'send_final_confirmation') {
+      // First check if the AI provided the confirmed_datetime directly
+      if (aiDecision.confirmed_datetime) {
+        sessionUpdateData.confirmed_datetime = aiDecision.confirmed_datetime;
+        sessionUpdateData.status = 'confirmed';
+        console.log(`Using AI-provided confirmed date/time: ${aiDecision.confirmed_datetime}`);
+      } else {
+        // Otherwise try to extract it from the email body
+        const confirmedDateTime = extractConfirmedDateTime(email_body);
+        if (confirmedDateTime) {
+          sessionUpdateData.confirmed_datetime = confirmedDateTime;
+          sessionUpdateData.status = 'confirmed';
+          console.log(`Extracted confirmed date/time: ${confirmedDateTime}`);
+        } else {
+          console.log(`Could not extract confirmed date/time from final confirmation email`);
+        }
+      }
     }
     
     const { error: updateSessionError } = await supabase

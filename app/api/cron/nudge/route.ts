@@ -100,8 +100,9 @@ export async function GET(request: Request) {
         if (nextStatus !== participant.status) {
           const pseudoTriggerId = `cron-nudge-${session.session_id}-${participant.email}`;
           
+          // Send Nudge/Escalation Email
           const messageId = await sendSchedulingEmail({
-            to: recipient,
+            to: recipient, // This is participant for Nudge 1/2, organizer for escalation
             subject: emailSubject,
             textBody: emailBody,
             sessionId: session.session_id,
@@ -115,6 +116,36 @@ export async function GET(request: Request) {
             // Update timestamp on nudge/escalation too, so thresholds reset relative to the last action
             participantDetails[i] = { ...participant, status: nextStatus, last_request_sent_at: new Date().toISOString() }; 
             detailsUpdated = true;
+
+            // --- NEW: Notify Organizer after Nudge 1 --- 
+            if (nextStatus === 'nudged_1' && !isEscalation) { // Check if it was Nudge 1 and not the final escalation
+                console.log(`Cron: Sending notification to organizer ${session.organizer_email} about Nudge 1 sent to ${participant.email}`);
+                const organizerSubject = `Update: Nudge sent for ${session.meeting_topic || 'meeting'}`;
+                const organizerBody = `Hi ${session.organizer_email.split('@')[0]},
+
+Just letting you know I've sent a reminder (Nudge 1) to ${participant.email} regarding their availability for the "${session.meeting_topic || 'meeting'}".
+
+I'll keep you posted.
+
+Thanks,
+Amy`;
+
+                const pseudoOrganizerTriggerId = `cron-notify-organizer-${session.session_id}-${participant.email}`;
+
+                await sendSchedulingEmail({
+                  to: session.organizer_email,
+                  subject: organizerSubject,
+                  textBody: organizerBody,
+                  sessionId: session.session_id,
+                  triggeringMessageId: pseudoOrganizerTriggerId, // Different ID for this notification
+                  triggeringReferencesHeader: null, // Don't thread this with the nudge itself
+                  sendAsGroup: false,
+                });
+                // We don't necessarily need to check the messageId for this notification,
+                // but could add logging if needed.
+            }
+            // --- End Notify Organizer --- 
+
           } else {
             console.error(`Cron: Failed to send email for ${participant.email} in session ${session.session_id}`);
             // Decide if we should retry later or just log

@@ -1090,11 +1090,17 @@ export async function POST(req: Request) {
 
     // --- Send Email if needed ---
     if (finalRecipients.length > 0 && email_body && email_body.trim().length > 0) {
-        console.log(`Final determined recipients: ${finalRecipients.join(', ')}`);
+        console.log(`Attempting email send. Recipients: ${finalRecipients.join(', ')}`);
         const outgoingSubject = subject.startsWith('Re:') ? subject : `Re: ${subject}`;
+
+        // Log details before sending
+        console.log(`  Subject: ${outgoingSubject}`);
+        console.log(`  Body snippet: ${email_body.substring(0, 100)}...`);
 
         // Determine sendAsGroup flag
         const sendAsGroup = next_step === 'send_final_confirmation';
+
+        console.log(`  Calling sendSchedulingEmail function...`);
 
         outgoingMessageId = await sendSchedulingEmail({
             to: finalRecipients,
@@ -1108,6 +1114,7 @@ export async function POST(req: Request) {
 
         // --- Save AI Response ---
         if (outgoingMessageId) { // Only save if email was sent successfully (got an ID)
+             console.log(`  sendSchedulingEmail returned message ID: ${outgoingMessageId}. Proceeding to save AI response.`);
              console.log("Saving AI response to DB.");
              const { error: aiSaveError } = await supabase
                 .from('session_messages')
@@ -1124,11 +1131,18 @@ export async function POST(req: Request) {
              if (aiSaveError) console.error('Supabase error saving AI message:', aiSaveError);
              else console.log("AI Response saved to DB.");
         } else {
-             console.error("Failed to send email, AI response not saved to DB.");
+             console.error(`ERROR: sendSchedulingEmail failed to return a message ID. Email likely not sent to ${finalRecipients.join(', ')}. AI response NOT saved.`);
         }
 
     } else {
-      console.warn(`AI decided next step: ${next_step}, but no valid recipients/body found. No email sent.`);
+      // Log why email wasn't attempted
+      if (finalRecipients.length === 0) {
+        console.log(`Email not sent: No valid final recipients determined for next_step: ${next_step}.`);
+      } else if (!email_body || email_body.trim().length === 0) {
+        console.log(`Email not sent: AI generated an empty email body for next_step: ${next_step}.`);
+      } else {
+        console.log(`Email not sent: Conditions not met (Recipients: ${finalRecipients.length}, Body exists: ${!!email_body}). Next step: ${next_step}.`);
+      }
     }
 
     // --- Update Session State ---
@@ -1199,7 +1213,7 @@ export async function POST(req: Request) {
     // --- Ensure Langfuse data is flushed --- 
     if (trace) { // Only shutdown if trace was created
       console.log("Shutting down Langfuse...");
-      await langfuse.shutdown();
+      await langfuse.shutdownAsync();
       console.log("Langfuse shutdown complete.");
     }
   }

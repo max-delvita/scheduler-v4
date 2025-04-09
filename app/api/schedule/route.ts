@@ -74,31 +74,49 @@ async function sendSchedulingEmail({
   subject,
   textBody,
   sessionId, // Add sessionId to construct Reply-To
-  replyToMessageId, 
-  referencesMessageId
+  triggeringMessageId, // ID of the email this one is replying to
+  triggeringReferencesHeader, // References header from the triggering email
 }: {
   to: string | string[];
   subject: string;
   textBody: string;
   sessionId: string; // Make sessionId required for sending
-  replyToMessageId?: string | null;
-  referencesMessageId?: string | null;
-}): Promise<string | null> { 
+  triggeringMessageId: string; // The MessageID of the email that triggered this send action
+  triggeringReferencesHeader: string | null; // The References header value from the triggering email
+}): Promise<string | null> {
   const baseFromAddress = process.env.POSTMARK_SENDER_ADDRESS || 'scheduler@yourdomain.com';
   if (baseFromAddress === 'scheduler@yourdomain.com') {
       console.warn("POSTMARK_SENDER_ADDRESS environment variable not set, using default.");
   }
-  
+
   // Construct the unique Reply-To address using Mailbox Hash strategy
   const replyToAddress = `${baseFromAddress.split('@')[0]}+${sessionId}@${baseFromAddress.split('@')[1]}`;
   console.log(`Setting Reply-To: ${replyToAddress}`);
 
+  // --- Construct Threading Headers ---
   const postmarkHeaders: Header[] = [];
-  let refs = '';
-  if (referencesMessageId) refs += `<${referencesMessageId}>`;
-  if (replyToMessageId && replyToMessageId !== referencesMessageId) refs += ` <${replyToMessageId}>`;
-  if (refs) postmarkHeaders.push({ Name: 'References', Value: refs.trim() });
-  if (referencesMessageId) postmarkHeaders.push({ Name: 'In-Reply-To', Value: `<${referencesMessageId}>` });
+  const triggerIdFormatted = `<${triggeringMessageId}>`;
+
+  // Set In-Reply-To to the triggering message ID
+  postmarkHeaders.push({ Name: 'In-Reply-To', Value: triggerIdFormatted });
+  console.log(`Setting In-Reply-To: ${triggerIdFormatted}`);
+
+  // Construct References: Start with existing references, then add the triggering ID if not present
+  let refs = triggeringReferencesHeader || ''; // Start with existing refs (can be null/empty)
+  if (!refs.includes(triggerIdFormatted)) {
+    if (refs) refs += ' '; // Add space if appending to existing refs
+    refs += triggerIdFormatted;
+  }
+
+  if (refs) {
+    postmarkHeaders.push({ Name: 'References', Value: refs.trim() });
+    console.log(`Setting References: ${refs.trim()}`);
+  } else {
+    // If there were no original references, the References header is just the In-Reply-To value
+    postmarkHeaders.push({ Name: 'References', Value: triggerIdFormatted });
+     console.log(`Setting References (initial): ${triggerIdFormatted}`);
+  }
+  // --- End Threading Headers ---
 
   try {
     console.log(`Attempting to send email via Postmark to: ${Array.isArray(to) ? to.join(', ') : to}`);
@@ -450,8 +468,8 @@ ${textBody}`;
             subject: outgoingSubject,
             textBody: email_body,
             sessionId, // Pass session ID for Reply-To construction
-            replyToMessageId: initialMessageIdForThread,
-            referencesMessageId: messageId
+            triggeringMessageId: messageId, // Pass the ID of the email we received
+            triggeringReferencesHeader: referencesHeader || null // Pass the References from the received email
         });
     // --- Save AI Response --- 
     console.log("Saving AI response to DB.");

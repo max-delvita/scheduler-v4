@@ -723,8 +723,8 @@ export async function POST(req: Request) {
          .insert({
            organizer_email: senderEmail,
            meeting_topic: subject,
-           session_status: 'pending_participant_response', // Initial session status
-           participant_status_details: initialParticipantStatus, // Store participant statuses
+           status: 'pending_participant_response', // Initial status
+           participant_status_details: initialParticipantStatus,
            webhook_target_address: recipientEmail || 'unknown',
            participants: sessionParticipants, // Still store the simple list for quick reference? Maybe remove if participant_status_details is primary.
            organizer_timezone: detectTimeZone(textBody, senderEmail) || headerTimezone,
@@ -756,7 +756,7 @@ export async function POST(req: Request) {
      // --- Fetch current session state including participant statuses ---
     const { data: currentSessionState, error: stateFetchError } = await supabase
         .from('scheduling_sessions')
-        .select('session_status, participant_status_details, organizer_email, participants') // Fetch necessary fields
+        .select('status, participant_status_details, organizer_email, participants') // Fetch necessary fields
         .eq('session_id', sessionId)
         .single();
 
@@ -843,7 +843,7 @@ export async function POST(req: Request) {
             // Update session status? Maybe change to 'pending_organizer_confirmation'?
              await supabase
                .from('scheduling_sessions')
-               .update({ session_status: 'pending_organizer_confirmation' }) // Update status
+               .update({ status: 'pending_organizer_confirmation' }) // Update status
                .eq('session_id', sessionId);
              // Fall through to call AI below
         }
@@ -1058,8 +1058,8 @@ export async function POST(req: Request) {
     }
 
     // --- Update Session State ---
-    // Determine the next overall session_status based on AI's next_step
-    let nextSessionStatus = currentSessionState.session_status; // Default to current
+    // Determine the next overall status based on AI's next_step
+    let nextSessionStatus = currentSessionState.status; // Default to current
     switch(next_step) {
         case 'ask_participant_availability':
         case 'propose_time_to_participant':
@@ -1078,7 +1078,7 @@ export async function POST(req: Request) {
         // 'no_action_needed' doesn't change the status from the previous state
     }
 
-    const sessionUpdateData: Record<string, any> = { session_status: nextSessionStatus }; // Use session_status now
+    const sessionUpdateData: Record<string, any> = { status: nextSessionStatus }; // Use status now
 
     // (Keep existing logic for updating meeting_duration, meeting_location, confirmed_datetime)
      // Check for duration and location in the latest message

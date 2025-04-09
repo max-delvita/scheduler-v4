@@ -31,7 +31,7 @@ export async function GET(request: Request) {
     const { data: pendingSessions, error: fetchError } = await supabase
       .from('scheduling_sessions')
       .select('session_id, organizer_email, meeting_topic, participant_status_details')
-      .eq('session_status', 'pending_participant_response');
+      .eq('status', 'pending_participant_response');
 
     if (fetchError) {
       console.error('Cron: Error fetching pending sessions:', fetchError);
@@ -117,12 +117,12 @@ export async function GET(request: Request) {
 
       // 3. Update database if changes were made
       if (detailsUpdated) {
-          const updateData: { participant_status_details: ParticipantStatusDetail[]; session_status?: string } = {
+          const updateData: { participant_status_details: ParticipantStatusDetail[]; status?: string } = {
               participant_status_details: participantDetails,
           };
           if (sessionEscalated) {
               console.log(`Cron: Session ${session.session_id} escalated to organizer.`);
-              updateData.session_status = 'escalated_to_organizer';
+              updateData.status = 'escalated_to_organizer';
           }
 
           const { error: updateError } = await supabase

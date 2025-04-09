@@ -6,29 +6,24 @@ services:
     buildCommand: npm install && npm run build # Or your specific build command
     startCommand: npm start # Or your specific start command
     envVars:
+      # Only define non-secret variables here, or override specific ones if needed.
+      # Rely on the Render Dashboard UI for secrets like API keys, Supabase URL/Key, etc.
       - key: NODE_ENV
         value: production
-      # --- ADD ALL YOUR OTHER REQUIRED ENV VARS HERE ---
-      # For these, ensure Secrets with these exact names exist in Render
-      - key: SUPABASE_URL
-      - key: SUPABASE_SERVICE_ROLE_KEY
-      - key: POSTMARK_SERVER_TOKEN
-      - key: OPENAI_API_KEY
-      - key: LANGFUSE_SECRET_KEY
-      - key: LANGFUSE_PUBLIC_KEY
-      # For these, we provide the value directly
-      - key: POSTMARK_SENDER_ADDRESS
+      - key: POSTMARK_SENDER_ADDRESS 
         value: amy@yourdomain.com # Replace with your actual sender address
       - key: LANGFUSE_BASEURL
         value: https://cloud.langfuse.com # Or your correct URL (NO QUOTES)
-      # Add any others your application needs
+      # Ensure SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, POSTMARK_SERVER_TOKEN, 
+      # OPENAI_API_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_PUBLIC_KEY are set 
+      # directly in the Render Service Environment dashboard.
 
   # --- Define the Cron Job as a separate service ---
   - type: cron
     name: nudge-scheduler # Give the cron service a name
     runtime: node # Runtime env for the cron runner itself (doesn't impact curl)
     schedule: "*/2 * * * *" # Your desired schedule
-    # buildCommand: 'echo "No build needed for curl command"' # Often not needed for simple commands
+    # buildCommand: 'echo "No build needed for curl command"' # Often not needed
     startCommand: curl -sf ${RENDER_EXTERNAL_URL}/api/cron/nudge # The command to execute
     # Note: RENDER_EXTERNAL_URL here should automatically reference the primary 
     # web service ('scheduler-agent-prod') defined within the same blueprint.

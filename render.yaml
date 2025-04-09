@@ -9,20 +9,16 @@ services:
       - key: NODE_ENV
         value: production
       # --- ADD ALL YOUR OTHER REQUIRED ENV VARS HERE ---
+      # For these, ensure Secrets with these exact names exist in Render
       - key: SUPABASE_URL
-        fromSecret: true # Example: if storing as Render secret with key SUPABASE_URL
       - key: SUPABASE_SERVICE_ROLE_KEY
-        fromSecret: true # Example: if storing as Render secret with key SUPABASE_SERVICE_ROLE_KEY
       - key: POSTMARK_SERVER_TOKEN
-        fromSecret: true # Example: if storing as Render secret with key POSTMARK_SERVER_TOKEN
+      - key: OPENAI_API_KEY
+      - key: LANGFUSE_SECRET_KEY
+      - key: LANGFUSE_PUBLIC_KEY
+      # For these, we provide the value directly
       - key: POSTMARK_SENDER_ADDRESS
         value: amy@yourdomain.com # Replace with your actual sender address
-      - key: OPENAI_API_KEY
-        fromSecret: true # Example: if storing as Render secret with key OPENAI_API_KEY
-      - key: LANGFUSE_SECRET_KEY
-        fromSecret: true # Example: if storing as Render secret with key LANGFUSE_SECRET_KEY
-      - key: LANGFUSE_PUBLIC_KEY
-        fromSecret: true # Example: if storing as Render secret with key LANGFUSE_PUBLIC_KEY
       - key: LANGFUSE_BASEURL
         value: https://cloud.langfuse.com # Or your correct URL (NO QUOTES)
       # Add any others your application needs

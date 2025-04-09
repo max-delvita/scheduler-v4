@@ -7,6 +7,14 @@ import { NextResponse } from 'next/server'; // Use NextResponse for standard JSO
 import type { MessageSendingResponse, Header } from 'postmark/dist/client/models'; // Adjusted imports
 import type { InboundMessageDetails } from 'postmark/dist/client/models/messages/InboundMessage'; // Import Postmark Inbound type
 import { sendSchedulingEmail } from '../../../lib/emailUtils'; // Import the refactored function
+import { Langfuse } from "langfuse";
+
+const langfuse = new Langfuse({
+  secretKey: process.env.LANGFUSE_SECRET_KEY,
+  publicKey: process.env.LANGFUSE_PUBLIC_KEY,
+  baseUrl: process.env.LANGFUSE_BASEURL
+});
+
 
 // Allow streaming responses up to 30 seconds
 export const maxDuration = 30;

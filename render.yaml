@@ -1,0 +1,18 @@
+# This is an example, adjust based on your existing render.yaml if you have one
+# Make sure 'services' includes your main web service definition
+
+services:
+  - type: web # Or your specific service type (e.g., node)
+    name: your-web-service-name # Replace with your actual service name on Render
+    env: node # Or your runtime
+    # ... other service configurations (build command, start command, env vars, etc.)
+
+cronJobs:
+  - name: nudge-scheduler
+    schedule: "*/2 * * * *" # Run every 2 minutes (FOR TESTING)
+    # Command uses curl to hit the endpoint. Uses RENDER_EXTERNAL_URL.
+    # Add '-sf' flags: -s for silent (no progress meter), -f to fail silently on server errors (cron doesn't need output)
+    # Append the specific API path
+    # If using CRON_SECRET, add the -H header as shown in the commented line
+    command: curl -sf ${RENDER_EXTERNAL_URL}/api/cron/nudge
+    # command: curl -sf -H "Authorization: Bearer $CRON_SECRET" ${RENDER_EXTERNAL_URL}/api/cron/nudge # <-- Use this if using CRON_SECRET

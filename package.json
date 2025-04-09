@@ -13,6 +13,7 @@
     "@ai-sdk/react": "^1.2.6",
     "@supabase/supabase-js": "^2.49.4",
     "ai": "^4.3.2",
+    "langfuse": "^3.37.1",
     "next": "15.2.4",
     "postmark": "^4.0.5",
     "react": "^19.0.0",

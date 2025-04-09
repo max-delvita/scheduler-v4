@@ -306,7 +306,11 @@ IMPORTANT EMAIL BODY RULES:
 
 TONE AND STYLE GUIDELINES:
 *   Always write in a warm, friendly, and conversational tone as if you're a helpful human assistant.
-*   When introducing yourself in the *first* message to a participant, **use "Hi there,"** instead of "Hi [Name]," as the name provided in the context might just be derived from their email address. You can still use "Hi [Name]," when writing to the organizer, whose name is usually known accurately.
+*   **Initial Greeting to Participants:** When sending the *first* message to a participant (usually when the process starts and you need to ask for their availability):
+       1.  **First, examine the very first message in the conversation history (which is the organizer's initial request).** Read the body text carefully. Did the organizer mention the participant's name there (e.g., "Please schedule a meeting with John Doe", "Can you find time for me and Jane?")?
+       2.  **If you confidently identify the participant's name mentioned in that initial request body text, use *that* name in the greeting (e.g., "Hi John,").**
+       3.  **Otherwise (if the name wasn't mentioned in the body text or you're unsure), use the generic greeting "Hi there,".** This is safer than using the name derived from the email address found in the context.
+*   When writing to the organizer, you can generally use "Hi [Name]," as their name is usually known accurately from the context.
 *   After the initial contact, when referring to participants, use the name guidance provided in the 'IMPORTANT EMAIL BODY RULES' section (prioritizing names found in the conversation history/signatures).
 *   Use natural language and conversational phrases like "Thanks for your response", "I hope this works for you", or "Looking forward to hearing from you".
 *   Balance professionalism with warmth - be efficient but not robotic.
@@ -584,10 +588,29 @@ export async function POST(req: Request) {
   let sessionId: string | null = null;
   let conversationHistory: CoreMessage[] = [];
   let sessionOrganizer: string | null = null;
+  let trace: ReturnType<Langfuse["trace"]> | undefined = undefined;
   let sessionParticipants: string[] = [];
   let initialMessageIdForThread: string | null = null; // Still useful for References header
 
   try {
+    // --- Initialize Langfuse Trace ---
+    const initialTraceMetadata = { 
+      mailboxHash: mailboxHash,
+      postmarkMessageId: messageId,
+      subject: subject,
+      recipientEmail: recipientEmail,
+      // isNewSession will be updated later if session created
+    };
+    trace = langfuse.trace({
+      // Use sessionId if available, otherwise maybe a unique ID like messageId?
+      // Using messageId might create a new trace for every email if session isn't found initially.
+      // Consider if upserting based on a derived session identifier is better.
+      id: `schedule-session:${sessionId || messageId}`, 
+      name: "schedule-request",
+      userId: senderEmail, // Associate trace with the sender
+      metadata: initialTraceMetadata
+    });
+
     // --- Session Identification: Prioritize MailboxHash --- 
     if (mailboxHash && mailboxHash.length > 10) { // Basic check if hash looks valid (e.g., like a UUID)
        console.log(`Attempting session lookup using MailboxHash: ${mailboxHash}`);
@@ -748,6 +771,10 @@ export async function POST(req: Request) {
        sessionId = newSession.session_id;
        sessionOrganizer = newSession.organizer_email;
        let sessionOrganizerName = newSession.organizer_name;
+       // Update trace metadata to indicate a new session was created
+       trace?.update({ 
+         metadata: { ...initialTraceMetadata, isNewSession: true } 
+       });
        sessionParticipants = newSession.participants || []; // Keep this for now?
        conversationHistory = [];
        initialMessageIdForThread = actualMessageIdHeaderValue || null;
@@ -955,12 +982,34 @@ export async function POST(req: Request) {
     console.log(`Sending ${messagesForAI.length} messages to AI (excluding system prompt). Last message should be context.`);
     // --- Call AI using generateObject ---
     console.log("Calling generateObject...");
+
+    // --- Create Langfuse Generation ---
+    const lfGeneration = trace?.generation({
+      name: "scheduling-ai-decision",
+      input: messagesForAI, // Log the messages sent to the AI
+      model: 'gpt-4o', // Specify the model used
+      metadata: {
+        organizer: sessionOrganizerName || sessionOrganizer,
+        participants: participantDetails.map(p => p.email),
+        schemaUsed: 'schedulingDecisionSchema',
+        sessionId: sessionId, // Link generation explicitly to session
+      },
+      // You might need modelParameters if you set any non-defaults
+    });
+
     const { object: aiDecision, usage } = await generateObject({
       model: openai('gpt-4o'),
       schema: schedulingDecisionSchema,
       system: aiSystemMessage, // Use the updated system prompt
       messages: messagesForAI,
     });
+
+    // --- End Langfuse Generation ---
+    lfGeneration?.end({
+      output: aiDecision, // Log the structured object returned by the AI
+      usage: usage // Log the token usage
+    });
+
     console.log("AI Usage:", usage);
     console.log("AI Decision Object:", JSON.stringify(aiDecision, null, 2));
 
@@ -1146,5 +1195,12 @@ export async function POST(req: Request) {
     const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
     // Ensure we still return 200 to Postmark to prevent retries on unhandled errors
     return NextResponse.json({ error: 'Internal Server Error', details: errorMessage }, { status: 200 });
+  } finally {
+    // --- Ensure Langfuse data is flushed --- 
+    if (trace) { // Only shutdown if trace was created
+      console.log("Shutting down Langfuse...");
+      await langfuse.shutdown();
+      console.log("Langfuse shutdown complete.");
+    }
   }
 } 

@@ -204,7 +204,7 @@ Follow these steps:
 5.  Output your decision using the provided JSON schema with fields: 'next_step', 'recipients', 'email_body'.
 
 Workflow Stages & 'next_step' values:
-*   Initial Request Received (often CC'd): Identify participants from To/Cc (excluding organizer/self). The identified participants are listed in the user message. If the core intent is clearly to schedule a meeting and at least one participant is identified, prioritize using 'ask_participant_availability' and set 'recipients' to ONLY those identified participant emails. Assume standard meeting duration (e.g., 30-60 mins) if unspecified. Only use 'request_clarification' (emailing the organizer) if the meeting's *purpose* is completely unclear OR if *no participants* could be identified.
+*   Initial Request Received (often CC'd): When a new meeting request is received, your FIRST action should ALWAYS be to contact the PARTICIPANTS (not the organizer) to collect their availability. The participants' emails are listed in the "Participants involved in this session" field of the user message. Set 'next_step' to 'ask_participant_availability' and set 'recipients' to contain ONLY the participant emails (never include the organizer at this stage). Only use 'request_clarification' (emailing the organizer) if the meeting's purpose is completely unclear OR if no participants could be identified.
 *   Receiving Availability: Analyze the sender's response (using their name if available, e.g., "Bob mentioned he is available..."). If more participants need checking, use 'ask_participant_availability' or 'propose_time_to_participant' for the *next* participant listed in the session. If all participants responded, use 'propose_time_to_organizer' and email *only* the organizer with proposed time(s), clearly stating who suggested which times (e.g., "Bob suggested Tuesday at 4pm.").
 *   Organizer Confirmation: If organizer agrees, use 'send_final_confirmation' and include *all* participants and the organizer in recipients. If organizer disagrees/suggests changes, go back to asking participants using 'ask_participant_availability' or 'propose_time_to_participant'.
 *   Final Confirmation: Generate a summary email body and include all participants+organizer in recipients.
@@ -689,6 +689,14 @@ Participants involved in this session: ${sessionParticipants.join(', ') || 'None
 Email Body:
 ${textBody}`;
 
+    // Debug log to identify potential issue with participant identification
+    console.log('\n--- DEBUG: Participants and Session Info ---');
+    console.log(`Organizer Email: ${sessionOrganizer}`);
+    console.log(`Current Sender Email: ${senderEmail}`);
+    console.log(`Is sender the organizer: ${senderEmail === sessionOrganizer}`);
+    console.log(`Participant Emails: ${sessionParticipants.join(', ') || 'None'}`);
+    console.log('---------------------------------------\n');
+
     // Fetch time zone information if available
     let timeZoneContext = '';
     let meetingDetailsContext = '';
@@ -753,6 +761,22 @@ ${textBody}`;
     });
     console.log("AI Usage:", usage);
     console.log("AI Decision Object:", JSON.stringify(aiDecision, null, 2));
+    
+    // Enhanced debugging for AI decision-making
+    console.log('\n--- DEBUG: AI Decision Analysis ---');
+    console.log(`Next Step: ${aiDecision.next_step}`);
+    console.log(`AI Suggested Recipients: ${aiDecision.recipients?.join(', ') || 'None'}`);
+    if (aiDecision.next_step === 'ask_participant_availability') {
+      const participantsInRecipients = sessionParticipants.filter(p => 
+        aiDecision.recipients.includes(p)
+      ).length;
+      
+      console.log(`Participants correctly included in recipients: ${participantsInRecipients} of ${sessionParticipants.length}`);
+      
+      const organizerInRecipients = sessionOrganizer && aiDecision.recipients.includes(sessionOrganizer);
+      console.log(`Organizer incorrectly included in recipients: ${organizerInRecipients ? 'YES - ERROR' : 'No - Correct'}`);
+    }
+    console.log('---------------------------------------\n');
 
     // --- Determine Recipients based on AI Decision & DB Data --- 
     let outgoingMessageId: string | null = null;
@@ -764,8 +788,19 @@ ${textBody}`;
 
     // Determine recipients based on the *AI's chosen next_step* and *session data*
     if (next_step === 'ask_participant_availability' || next_step === 'propose_time_to_participant') {
-        finalRecipients = aiSuggestedRecipients || [];
-         console.log(`Step requires emailing participant(s). Using AI recipients: ${finalRecipients.join(', ')}`);
+        // SAFEGUARD: For initial availability requests, ensure we only email participants (never the organizer)
+        if (next_step === 'ask_participant_availability' && conversationHistory.length === 0) {
+            // This is the first message in this session - make sure we only contact participants
+            finalRecipients = sessionParticipants.filter(email => 
+                email !== sessionOrganizer && // Never include organizer
+                (!aiSuggestedRecipients || aiSuggestedRecipients.includes(email)) // Respect AI's participant selection if provided
+            );
+            console.log(`SAFEGUARD: First message - ensuring only participants are contacted: ${finalRecipients.join(', ')}`);
+        } else {
+            // Normal case - use AI's selection
+            finalRecipients = aiSuggestedRecipients || [];
+            console.log(`Step requires emailing participant(s). Using AI recipients: ${finalRecipients.join(', ')}`);
+        }
     } else if (next_step === 'propose_time_to_organizer' || next_step === 'request_clarification') {
         if (sessionOrganizer) {
             finalRecipients = [sessionOrganizer];

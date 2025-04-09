@@ -1,22 +1,6 @@
 services:
   # --- Define the Web Service first ---
-  - type: web
-    name: scheduler-agent-prod # Ensure this name is unique in your Render account
-    runtime: node # Or your specific node version if needed, e.g., node:18
-    buildCommand: npm install && npm run build # Or your specific build command
-    startCommand: npm start # Or your specific start command
-    envVars:
-      # Only define non-secret variables here, or override specific ones if needed.
-      # Rely on the Render Dashboard UI for secrets like API keys, Supabase URL/Key, etc.
-      - key: NODE_ENV
-        value: production
-      - key: POSTMARK_SENDER_ADDRESS 
-        value: amy@yourdomain.com # Replace with your actual sender address
-      - key: LANGFUSE_BASEURL
-        value: https://cloud.langfuse.com # Or your correct URL (NO QUOTES)
-      # Ensure SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, POSTMARK_SERVER_TOKEN, 
-      # OPENAI_API_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_PUBLIC_KEY are set 
-      # directly in the Render Service Environment dashboard.
+
 
   # --- Define the Cron Job as a separate service ---
   - type: cron

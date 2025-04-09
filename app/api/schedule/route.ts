@@ -10,6 +10,45 @@ import type { InboundMessageDetails } from 'postmark/dist/client/models/messages
 // Allow streaming responses up to 30 seconds
 export const maxDuration = 30;
 
+// Helper function to detect time zone information in email content
+function detectTimeZone(emailBody: string, senderEmail: string): string | null {
+  // Common timezone patterns and abbreviations
+  const timezonePatterns = [
+    // GMT/UTC patterns
+    { regex: /GMT[+-]\d{1,2}(?::\d{2})?/gi, extract: (match: string) => match },
+    { regex: /UTC[+-]\d{1,2}(?::\d{2})?/gi, extract: (match: string) => match },
+    
+    // Named time zones with potential offsets
+    { regex: /(?:(?:Eastern|Pacific|Central|Mountain|Atlantic)\s+(?:Standard|Daylight|Savings)?\s*Time)/gi, extract: (match: string) => match },
+    
+    // Common abbreviations
+    { regex: /\b(?:EST|EDT|PST|PDT|CST|CDT|MST|MDT|AKST|AKDT|HST|AEST|IST|BST|CET|EET|JST|CST)\b/g, extract: (match: string) => match },
+    
+    // Time with explicit zone
+    { regex: /\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s+([a-z]{3,5})/gi, extract: (match: string, groups: string[]) => groups[0] },
+    
+    // Common timezone mentions
+    { regex: /time(?:\s+)?zone(?:\s+)?(?:is|:)?\s+([a-z0-9\/\s\+\-\_]+)/gi, extract: (match: string, groups: string[]) => groups[0]?.trim() }
+  ];
+  
+  // Try each pattern
+  for (const pattern of timezonePatterns) {
+    const matches = emailBody.match(pattern.regex);
+    if (matches && matches.length > 0) {
+      // Return the first match
+      return matches[0];
+    }
+  }
+  
+  // Try to extract from common phrases
+  if (emailBody.includes("my timezone") || emailBody.includes("my time zone")) {
+    const timezoneContext = emailBody.split(/my\s+time(?:\s+)?zone(?:\s+)?(?:is|:)?/i)[1]?.trim().split(/[.,\n]/)[0]?.trim();
+    if (timezoneContext) return timezoneContext;
+  }
+  
+  return null;
+}
+
 // Define the Zod schema for the AI's structured output
 const schedulingDecisionSchema = z.object({
   next_step: z.enum([
@@ -51,8 +90,74 @@ IMPORTANT EMAIL BODY RULES:
 *   The 'email_body' field should contain ONLY the text for the email body.
 *   Do NOT include greetings like "Hi [Name]," unless the 'recipients' array contains exactly ONE email address.
 *   Do NOT include subject lines.
-*   Be clear, concise, and professional.
-*   **Crucially: When relaying availability or proposing times based on a participant's response, refer to them by name if you know it (e.g., "Alice suggested...", "Regarding Bob's availability..."). Do not attribute availability to yourself (Amy).**`;
+*   Be clear, concise, and professional, but also warm and friendly.
+*   **Crucially: When relaying availability or proposing times based on a participant's response, refer to them by name if you know it (e.g., "Alice suggested...", "Regarding Bob's availability..."). Do not attribute availability to yourself (Amy).**
+
+TIME ZONE HANDLING:
+*   If you identify time zone information in the conversation (e.g., "I'm in EST", "3pm PST works for me"), use it when discussing times.
+*   When a time is mentioned with a time zone (e.g., "4pm EST"), display this time in the recipient's time zone if known (e.g., "4pm EST / 1pm PST" when writing to someone in PST).
+*   For the final confirmation, always include the meeting time in all relevant time zones if participants are in different time zones.
+*   If no time zone information is provided, keep times as stated in the original messages.
+*   Time zones may appear as abbreviations (EST, PST, GMT+1) or full names (Eastern Time, Pacific Standard Time).
+
+Time Proposal Format: When using 'propose_time_to_organizer', format the email_body like this:
+
+PROPOSED MEETING TIME(S)
+Topic: {meeting_topic}
+
+Based on everyone's availability, here are the possible meeting times:
+
+OPTION 1:
+Date: {date1}
+Time: {start_time1} - {end_time1} {primary_timezone1}
+{If participants are in different time zones, include conversions:
+Time in EST: 4:00 PM - 5:00 PM
+Time in PST: 1:00 PM - 2:00 PM}
+
+OPTION 2:
+Date: {date2}
+Time: {start_time2} - {end_time2} {primary_timezone2}
+{Include time zone conversions if needed}
+
+AVAILABILITY SUMMARY:
+{list each participant and their available times in bullet points}
+
+Please reply with your preferred option, or suggest an alternative time.
+
+Participant Availability Request Format: When using 'ask_participant_availability', format the email_body like this:
+
+MEETING REQUEST: {meeting_topic}
+Organizer: {organizer_name}
+
+I'm helping to schedule the following meeting:
+
+Topic: {meeting_topic}
+Duration: {duration or "30-60 minutes if not specified"}
+Proposed date range: {date_range or "in the next week" if not specified}
+
+Please reply with times you are available. You can respond in any format that works for you.
+
+Final Confirmation Format: When using 'send_final_confirmation', format the email_body like this:
+
+MEETING CONFIRMED
+
+Topic: {meeting_topic}
+Date: {date}
+Time: {start_time} - {end_time} {primary_timezone}
+{If different time zones detected, list conversions here like: 
+Time in EST: 4:00 PM - 5:00 PM
+Time in PST: 1:00 PM - 2:00 PM}
+Duration: {duration}
+Location: {location or "Virtual"}
+
+PARTICIPANTS:
+- {organizer_name} (Organizer)
+{list all participants with bullet points}
+
+MEETING DETAILS:
+{Include any additional context, agenda items, preparation needed, etc.}
+
+This confirmation has been sent to all participants.`;
 
 // Helper function to map DB message types to AI CoreMessage roles
 function mapDbMessageToCoreMessage(dbMessage: { message_type: string; body_text: string | null }): CoreMessage | null {
@@ -359,6 +464,7 @@ export async function POST(req: Request) {
            status: 'pending',
            webhook_target_address: recipientEmail || 'unknown',
            participants: sessionParticipants,
+           organizer_timezone: detectTimeZone(textBody, senderEmail), // Add organizer timezone
          })
          .select('session_id, organizer_email, participants')
          .single();
@@ -386,6 +492,38 @@ export async function POST(req: Request) {
       sessionOrganizer && senderEmail === sessionOrganizer
         ? 'human_organizer'
         : 'human_participant';
+    
+    // If this is a participant response, check for timezone information
+    if (incomingMessageType === 'human_participant') {
+      const participantTimezone = detectTimeZone(textBody, senderEmail);
+      if (participantTimezone) {
+        // Store participant timezone in a JSON field
+        try {
+          const { error: tzUpdateError } = await supabase
+            .from('scheduling_sessions')
+            .update({
+              participant_timezones: JSON.stringify({ 
+                ...JSON.parse((await supabase
+                  .from('scheduling_sessions')
+                  .select('participant_timezones')
+                  .eq('session_id', sessionId)
+                  .single()).data?.participant_timezones || '{}'),
+                [senderEmail]: participantTimezone
+              })
+            })
+            .eq('session_id', sessionId);
+            
+          if (tzUpdateError) {
+            console.error('Failed to update participant timezone:', tzUpdateError);
+          } else {
+            console.log(`Updated timezone for participant ${senderEmail}: ${participantTimezone}`);
+          }
+        } catch (e) {
+          console.error('Error updating participant timezone:', e);
+        }
+      }
+    }
+    
     console.log(`Saving incoming message as type: ${incomingMessageType}`);
     const { error: insertError } = await supabase.from('session_messages').insert({
         session_id: sessionId,
@@ -410,9 +548,40 @@ Participants involved in this session: ${sessionParticipants.join(', ') || 'None
 
 Email Body:
 ${textBody}`;
+
+    // Fetch time zone information if available
+    let timeZoneContext = '';
+    const { data: sessionTimeZones } = await supabase
+      .from('scheduling_sessions')
+      .select('organizer_timezone, participant_timezones')
+      .eq('session_id', sessionId)
+      .single();
+    
+    if (sessionTimeZones) {
+      let timeZones = [];
+      
+      if (sessionTimeZones.organizer_timezone) {
+        timeZones.push(`${sessionOrganizer} (Organizer): ${sessionTimeZones.organizer_timezone}`);
+      }
+      
+      if (sessionTimeZones.participant_timezones) {
+        const participantTzs = typeof sessionTimeZones.participant_timezones === 'string' 
+          ? JSON.parse(sessionTimeZones.participant_timezones) 
+          : sessionTimeZones.participant_timezones;
+          
+        for (const [email, tz] of Object.entries(participantTzs)) {
+          timeZones.push(`${email}: ${tz}`);
+        }
+      }
+      
+      if (timeZones.length > 0) {
+        timeZoneContext = `\n\nKnown Time Zones:\n${timeZones.join('\n')}`;
+      }
+    }
+
     const messagesForAI: CoreMessage[] = [
       ...conversationHistory,
-      { role: 'user', content: currentMessageContent },
+      { role: 'user', content: currentMessageContent + timeZoneContext },
     ];
     console.log(`Sending ${messagesForAI.length} messages to AI (excluding system prompt).`);
 

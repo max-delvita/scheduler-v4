@@ -267,6 +267,8 @@ const schedulingDecisionSchema = z.object({
     'send_final_confirmation', // All agreed, send calendar invite details
     'process_cancellation', // Meeting is definitely cancelled (Organizer or sole participant cancels)
     'inform_organizer_of_participant_cancellation', // One participant (of many) cancelled, ask organizer what to do
+    'process_organizer_change_request', // Organizer requested a change/reschedule
+    'inform_organizer_of_participant_change_request', // Participant requested a change/reschedule
     'no_action_needed', // e.g., received a simple thank you, nothing to schedule/reply to
     'error_cannot_schedule', // Cannot fulfill the request
   ]).describe("The next logical step in the scheduling process based on the conversation."),
@@ -300,11 +302,14 @@ Workflow Stages & 'next_step' values:
 *   Organizer Confirmation: If organizer agrees, use 'send_final_confirmation' and include *all* participants and the organizer in recipients. If organizer disagrees/suggests changes (e.g., proposes a new time), use 'propose_time_to_participant' to relay the organizer's new suggestion to the participant(s). Only use 'ask_participant_availability' if the organizer rejects the time but doesn't offer a specific alternative.
 *   Final Confirmation: Generate a summary email body and include all participants+organizer in recipients.
 *   Handling Cancellations:
-       1. Identify who sent the cancellation request (Organizer or Participant) by checking the sender against the Session Context.
-       2. Check the number of participants listed in the Session Context.
-       3. **If the Organizer sent the cancellation:** Set next_step='process_cancellation'. Set recipients to include the organizer and ALL participants. Generate an email confirming the meeting is cancelled.
-       4. **If a Participant sent the cancellation AND they are the *only* participant:** Set next_step='process_cancellation'. Set recipients to include the organizer and the cancelling participant. Generate an email confirming the meeting is cancelled.
-       5. **If a Participant sent the cancellation AND there are *other* participants remaining:** Set next_step='inform_organizer_of_participant_cancellation'. Set recipients to *only* the organizer. Generate an email informing the organizer which participant cancelled and asking how they want to proceed (e.g., continue without them, reschedule, cancel entirely).
+        1. Identify who sent the cancellation request (Organizer or Participant) by checking the sender against the Session Context.
+        2. Check if the meeting was already confirmed (e.g., session status is 'confirmed').
+        3. **If Organizer cancels (anytime):** Set next_step='process_cancellation'. Recipients = All. Generate confirmation.
+        4. **If a Participant cancels (anytime, before or after confirmation):** Set next_step='inform_organizer_of_participant_cancellation'. Recipients = Organizer only. Inform the organizer which participant cancelled and ask how they want to proceed (e.g., continue without them, reschedule, cancel entirely).
+*   Handling Change/Reschedule Requests (after meeting was confirmed):
+       1. Identify who sent the change request (Organizer or Participant).
+       2. **If the Organizer requests a change:** Set next_step='process_organizer_change_request'. Set recipients to ALL participants. Generate an email explaining the need to reschedule. If the organizer proposed a specific new time, relay it. If not, ask participants for their updated availability.
+       3. **If a Participant requests a change:** Set next_step='inform_organizer_of_participant_change_request'. Set recipients to ONLY the organizer. Inform the organizer which participant needs to reschedule the confirmed time and ask how to proceed.
 *   No Action: If the email is just a thank you or doesn't require a scheduling action, use 'no_action_needed' with empty recipients/body.
 *   Error: If scheduling is impossible or request is invalid, use 'error_cannot_schedule'.
 
@@ -493,6 +498,34 @@ How would you like to proceed?
 - Continue scheduling with the remaining participants?
 - Cancel this meeting request entirely?
 - Try to reschedule for everyone?
+
+Please let me know.
+
+Thanks,
+Amy
+
+Process Organizer Change Request Format: When using 'process_organizer_change_request', format the email_body like this:
+
+Hi team,
+
+[Organizer Name] needs to reschedule the confirmed meeting "[meeting_topic]".
+
+{If organizer proposed a specific new time: "They proposed meeting at [New Proposed Time] instead. Does this new time work for you?"}
+{If organizer did not propose a specific time: "Could you please reply with your updated availability for this meeting?"}
+
+Thanks,
+Amy
+
+Inform Organizer of Participant Change Request Format: When using 'inform_organizer_of_participant_change_request', format the email_body like this:
+
+Hi [Organizer Name],
+
+Regarding the confirmed meeting "[meeting_topic]", [Participant Name Who Wants Change] has indicated they need to reschedule.
+
+How would you like to proceed?
+- Ask me to find a new time that works for everyone?
+- Ask me to check if [New Time Suggested by Participant, if any] works?
+- Cancel the meeting for now?
 
 Please let me know.
 
@@ -1141,6 +1174,19 @@ export async function POST(req: Request) {
           console.error('Cannot inform organizer of cancellation: Organizer email not found.');
           finalRecipients = [];
         }
+    } else if (next_step === 'process_organizer_change_request') {
+        // Organizer change request goes to all participants
+        finalRecipients = participantDetails.map((p: ParticipantStatusDetail) => p.email);
+        console.log(`Step requires informing participants about organizer change request. Recipients: ${finalRecipients.join(', ')}`);
+    } else if (next_step === 'inform_organizer_of_participant_change_request') {
+        // Informing organizer of participant change request goes only to organizer
+        if (sessionOrganizer) {
+          finalRecipients = [sessionOrganizer];
+          console.log(`Step requires informing organizer (${sessionOrganizer}) about participant change request.`);
+        } else {
+          console.error('Cannot inform organizer of participant change: Organizer email not found.');
+          finalRecipients = [];
+        }
     } else {
         console.log(`Step is ${next_step}. No email recipients.`);
         finalRecipients = [];
@@ -1165,7 +1211,7 @@ export async function POST(req: Request) {
         console.log(`  Body snippet: ${email_body.substring(0, 100)}...`);
 
         // Determine sendAsGroup flag
-        const sendAsGroup = next_step === 'send_final_confirmation' || next_step === 'process_cancellation';
+        const sendAsGroup = next_step === 'send_final_confirmation' || next_step === 'process_cancellation' || next_step === 'process_organizer_change_request';
 
         console.log(`  Calling sendSchedulingEmail function...`);
 
@@ -1234,6 +1280,14 @@ export async function POST(req: Request) {
             // If just informing organizer, the session state likely goes back to waiting for organizer
             nextSessionStatus = 'pending_organizer_confirmation';
             break;
+        case 'process_organizer_change_request':
+            // Organizer wants change, need to get participant availability/confirmation again
+            nextSessionStatus = 'pending_participant_response'; 
+            break;
+        case 'inform_organizer_of_participant_change_request':
+            // Participant wants change, need organizer input
+            nextSessionStatus = 'pending_organizer_confirmation';
+            break;
         case 'error_cannot_schedule':
             nextSessionStatus = 'error';
             break;
@@ -1241,6 +1295,12 @@ export async function POST(req: Request) {
     }
 
     const sessionUpdateData: Record<string, any> = { status: nextSessionStatus }; // Use status now
+
+    // --- Clear confirmed time if rescheduling is initiated ---
+    if (next_step === 'process_organizer_change_request' || next_step === 'inform_organizer_of_participant_change_request') {
+      sessionUpdateData.confirmed_datetime = null; // Set confirmed time back to null
+      console.log(`Change request initiated (step: ${next_step}). Clearing confirmed_datetime.`);
+    }
 
     // (Keep existing logic for updating meeting_duration, meeting_location, confirmed_datetime)
      // Check for duration and location in the latest message
@@ -1253,18 +1313,13 @@ export async function POST(req: Request) {
       sessionUpdateData.meeting_location = detectedLocation.location;
       sessionUpdateData.is_virtual = detectedLocation.isVirtual;
     }
-     if (next_step === 'send_final_confirmation' || next_step === 'process_cancellation' || next_step === 'inform_organizer_of_participant_cancellation') {
-      if (next_step === 'send_final_confirmation' && aiDecision.confirmed_datetime) {
-        sessionUpdateData.confirmed_datetime = aiDecision.confirmed_datetime;
-      } else if (next_step === 'send_final_confirmation') { // Only try to extract if confirming and not provided
-        const confirmedDateTime = extractConfirmedDateTime(email_body);
-        if (confirmedDateTime) {
-          sessionUpdateData.confirmed_datetime = confirmedDateTime;
-        } else {
-          console.log(`Could not extract confirmed date/time from final confirmation email`);
-        }
-      }
-    }
+     if (next_step === 'send_final_confirmation') { // Only process confirmed_datetime on final confirmation
+       if (aiDecision.confirmed_datetime) {
+         sessionUpdateData.confirmed_datetime = aiDecision.confirmed_datetime;
+       } else {
+         console.log(`Could not extract confirmed date/time from final confirmation email`);
+       }
+     }
 
     const { error: updateSessionError } = await supabase
       .from('scheduling_sessions')

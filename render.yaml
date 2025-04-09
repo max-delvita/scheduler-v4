@@ -1,5 +1,5 @@
-# Define the primary web service that runs the Next.js app and API
 services:
+  # --- Define the Web Service first ---
   - type: web
     name: scheduler-agent-prod # Ensure this name is unique in your Render account
     runtime: node # Or your specific node version if needed, e.g., node:18
@@ -10,26 +10,30 @@ services:
         value: production
       # --- ADD ALL YOUR OTHER REQUIRED ENV VARS HERE ---
       - key: SUPABASE_URL
-        fromSecret: true # Example: if stored as Render secret
+        fromSecret: true # Example: if storing as Render secret with key SUPABASE_URL
       - key: SUPABASE_SERVICE_ROLE_KEY
-        fromSecret: true # Example: if stored as Render secret
+        fromSecret: true # Example: if storing as Render secret with key SUPABASE_SERVICE_ROLE_KEY
       - key: POSTMARK_SERVER_TOKEN
-        fromSecret: true # Example: if stored as Render secret
+        fromSecret: true # Example: if storing as Render secret with key POSTMARK_SERVER_TOKEN
       - key: POSTMARK_SENDER_ADDRESS
         value: amy@yourdomain.com # Replace with your actual sender address
       - key: OPENAI_API_KEY
-        fromSecret: true # Example: if stored as Render secret
+        fromSecret: true # Example: if storing as Render secret with key OPENAI_API_KEY
       - key: LANGFUSE_SECRET_KEY
-        fromSecret: true # Example: if stored as Render secret
+        fromSecret: true # Example: if storing as Render secret with key LANGFUSE_SECRET_KEY
       - key: LANGFUSE_PUBLIC_KEY
-        fromSecret: true # Example: if stored as Render secret
+        fromSecret: true # Example: if storing as Render secret with key LANGFUSE_PUBLIC_KEY
       - key: LANGFUSE_BASEURL
         value: https://cloud.langfuse.com # Or your correct URL (NO QUOTES)
       # Add any others your application needs
 
-# Define the scheduled task using the top-level 'cron:' key
-cron:
-  - job: nudgeParticipants # Name for the job
-    schedule: "*/2 * * * *" # Your desired schedule (e.g., every 2 mins for testing)
-    # This command hits the nudge endpoint on the web service defined above
-    command: curl -sf ${RENDER_EXTERNAL_URL}/api/cron/nudge
+  # --- Define the Cron Job as a separate service ---
+  - type: cron
+    name: nudge-scheduler # Give the cron service a name
+    runtime: node # Runtime env for the cron runner itself (doesn't impact curl)
+    schedule: "*/2 * * * *" # Your desired schedule
+    # buildCommand: 'echo "No build needed for curl command"' # Often not needed for simple commands
+    startCommand: curl -sf ${RENDER_EXTERNAL_URL}/api/cron/nudge # The command to execute
+    # Note: RENDER_EXTERNAL_URL here should automatically reference the primary 
+    # web service ('scheduler-agent-prod') defined within the same blueprint.
+    # No explicit envVar needed for it typically.

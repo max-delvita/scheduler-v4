@@ -1,21 +1,46 @@
 # This is an example, adjust based on your existing render.yaml if you have one
 # Make sure 'services' includes your main web service definition
 
-services:
-  - type: web # Or whatever your service type is
-    name: Scheduler_agent PROD # Or your service name
-    env: node # Or your runtime
-    envVars:
-      - key: NODE_ENV
-        value: production
+#  services:
+  #  - type: web # Or whatever your service type is
+    #  name: Scheduler_agent PROD # Or your service name
+    #  env: node # Or your runtime
+    #  envVars:
+      #  - key: NODE_ENV
+        #  value: production
     # ... other service configurations (build command, start command, env vars, etc.)
 
 
 # Add or uncomment the cron jobs section
-cron:
-  - job: nudgeParticipants # Give your job a name
-    schedule: "*/2 * * * *" # Example: Run every 5 minutes. Adjust as needed!
+#  cron:
+  #  - job: nudgeParticipants # Give your job a name
+    #  schedule: "*/2 * * * *" # Example: Run every 5 minutes. Adjust as needed!
     # Uncomment and adjust the command:
-    command: curl -sf ${RENDER_EXTERNAL_URL}/api/cron/nudge 
+    #  command: curl -sf ${RENDER_EXTERNAL_URL}/api/cron/nudge 
     # If you add CRON_SECRET checking in your API:
     # command: curl -sf -H "Authorization: Bearer $CRON_SECRET" ${RENDER_EXTERNAL_URL}/api/cron/nudge
+
+
+
+    services:
+  - type: web
+    name: Scheduler_agent_PROD
+    runtime: node
+    envVars:
+      - key: NODE_ENV
+        value: production
+    # ... other service configurations
+
+  - type: cron
+    name: nudge-scheduler
+    runtime: node
+    # repo: https://github.com/your-repo.git
+    schedule: "*/2 * * * *" 
+    buildCommand: 'echo "No Build Required"'
+    startCommand: 'curl -sf ${RENDER_EXTERNAL_URL}/api/cron/nudge'
+    envVars:
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          name: Scheduler_agent_PROD
+          type: web
+          property: hostport

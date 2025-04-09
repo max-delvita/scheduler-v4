@@ -49,6 +49,131 @@ function detectTimeZone(emailBody: string, senderEmail: string): string | null {
   return null;
 }
 
+// Helper function to detect meeting duration from email content
+function detectMeetingDuration(emailBody: string): string | null {
+  // Common duration patterns
+  const durationPatterns = [
+    // Duration in minutes or hours with units
+    { regex: /(?:for|duration|length|lasting)?\s*(?:of)?\s*(\d+)\s*(?:hour|hr|hours|hrs|min|minute|minutes)/gi, extract: (match: string) => match.trim() },
+    
+    // X-minute or X-hour mentions
+    { regex: /(\d+)[-\s](?:hour|hr|minute|min)(?:\s+meeting|\s+call)?/gi, extract: (match: string) => match.trim() },
+    
+    // Duration range
+    { regex: /(\d+)(?:\s*-\s*|\s+to\s+)(\d+)\s*(?:mins?|minutes|hours|hrs)/gi, extract: (match: string) => match.trim() },
+    
+    // Time range like "from 2pm to 3pm" or "2-3pm"
+    { regex: /(?:from\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)(?:\s*-\s*|\s+to\s+)(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/gi, 
+      extract: (match: string) => {
+        // Simple extractor - future enhancement could calculate actual duration
+        return match.trim();
+      }
+    },
+    
+    // Standard meeting durations
+    { regex: /(?:standard|regular|typical|quick|brief|short|long)\s+(?:meeting|call)/gi, 
+      extract: (match: string) => {
+        const lowerMatch = match.toLowerCase().trim();
+        // Map common descriptions to durations
+        if (lowerMatch.includes('quick') || lowerMatch.includes('brief') || lowerMatch.includes('short')) {
+          return '30 minutes';
+        } else if (lowerMatch.includes('standard') || lowerMatch.includes('regular') || lowerMatch.includes('typical')) {
+          return '60 minutes';
+        } else if (lowerMatch.includes('long')) {
+          return '90 minutes';
+        }
+        return match.trim();
+      }
+    }
+  ];
+  
+  // Try each pattern
+  for (const pattern of durationPatterns) {
+    const matches = emailBody.match(pattern.regex);
+    if (matches && matches.length > 0) {
+      // Return the first match
+      return pattern.extract(matches[0]);
+    }
+  }
+  
+  return null;
+}
+
+// Helper function to detect meeting location from email content
+function detectMeetingLocation(emailBody: string): { isVirtual: boolean, location: string | null } {
+  const defaultResult = { isVirtual: true, location: "Virtual" };
+  
+  // Check for virtual meeting indicators
+  const virtualMeetingPatterns = [
+    /(?:zoom|teams|google meet|meet\.google|webex|skype|hangouts|virtual|online|web|video|conference call)/i,
+    /(?:call|conference|meeting) link/i,
+    /(?:join|connect)(?:\s+the)?\s+(?:meeting|call)/i,
+    /meeting url|url for (?:the|our) (?:meeting|call)/i
+  ];
+  
+  // Check for in-person meeting indicators
+  const inPersonPatterns = [
+    /(?:in[-\s]person|on[-\s]site|face[-\s]to[-\s]face|in[-\s]office|at\s+(?:the\s+)?office)/i,
+    /(?:meeting\s+room|conference\s+room|office\s+space|location\s*:)/i,
+    /(?:address\s*:|building|floor|suite|room\s+\d+|rm\s+\d+)/i
+  ];
+  
+  // Check for specific locations
+  const locationExtractPatterns = [
+    // Address pattern
+    { regex: /(?:at|in|location|address|place)\s*:?\s*((?:\d+\s+[a-z0-9\s\.,]+\b(?:street|st|avenue|ave|road|rd|boulevard|blvd|drive|dr|lane|ln|place|pl|court|ct|way|circle|cir|square|sq))[^.]*)/i, 
+      extract: (match: string, groups: string[]) => groups[0]?.trim() 
+    },
+    
+    // Room/building pattern
+    { regex: /(?:in|at)\s+(?:the\s+)?((?:conference|meeting)\s+room|(?:building|room|office)\s+[a-zA-Z0-9-]+)/i,
+      extract: (match: string, groups: string[]) => groups[0]?.trim()
+    },
+    
+    // Office/location name
+    { regex: /(?:at|in)\s+(?:the\s+)?([a-z0-9\s]+\b(?:office|headquarters|hq|building|campus|center|location))/i,
+      extract: (match: string, groups: string[]) => groups[0]?.trim()
+    },
+    
+    // Location directly after "at" or "in"
+    { regex: /(?:at|in)\s+(?:the\s+)?([A-Z][a-zA-Z0-9\s]+)(?:\s+(?:on|at)\s+)/i,
+      extract: (match: string, groups: string[]) => groups[0]?.trim()
+    }
+  ];
+  
+  // First check if it's a virtual meeting
+  for (const pattern of virtualMeetingPatterns) {
+    if (pattern.test(emailBody)) {
+      return defaultResult;
+    }
+  }
+  
+  // Then check if it's explicitly in-person
+  let isInPerson = false;
+  for (const pattern of inPersonPatterns) {
+    if (pattern.test(emailBody)) {
+      isInPerson = true;
+      break;
+    }
+  }
+  
+  // If it seems to be in-person, try to extract the location
+  if (isInPerson) {
+    for (const pattern of locationExtractPatterns) {
+      const match = emailBody.match(pattern.regex);
+      if (match && match.length > 1) {
+        return { isVirtual: false, location: match[1].trim() };
+      }
+    }
+    
+    // If we know it's in-person but couldn't extract a specific location
+    return { isVirtual: false, location: "In-person (location not specified)" };
+  }
+  
+  // Default to virtual if no clear indicators
+  return defaultResult;
+}
+
 // Define the Zod schema for the AI's structured output
 const schedulingDecisionSchema = z.object({
   next_step: z.enum([
@@ -100,6 +225,15 @@ TIME ZONE HANDLING:
 *   If no time zone information is provided, keep times as stated in the original messages.
 *   Time zones may appear as abbreviations (EST, PST, GMT+1) or full names (Eastern Time, Pacific Standard Time).
 
+MEETING DURATION AND LOCATION:
+*   Always include meeting duration in your communications when available (e.g., "30 minutes", "1 hour").
+*   If duration is not specified, ask the organizer how long the meeting will be.
+*   Clearly indicate whether the meeting is virtual or in-person.
+*   For virtual meetings, simply state "Location: Virtual" unless specific virtual meeting details are provided.
+*   For in-person meetings, include the full location details when available.
+*   When proposing times, confirm both the time and expected duration.
+*   In the final confirmation, include complete details about duration and location.
+
 Time Proposal Format: When using 'propose_time_to_organizer', format the email_body like this:
 
 PROPOSED MEETING TIME(S)
@@ -113,6 +247,8 @@ Time: {start_time1} - {end_time1} {primary_timezone1}
 {If participants are in different time zones, include conversions:
 Time in EST: 4:00 PM - 5:00 PM
 Time in PST: 1:00 PM - 2:00 PM}
+Duration: {duration}
+Location: {location}
 
 OPTION 2:
 Date: {date2}
@@ -134,6 +270,7 @@ I'm helping to schedule the following meeting:
 Topic: {meeting_topic}
 Duration: {duration or "30-60 minutes if not specified"}
 Proposed date range: {date_range or "in the next week" if not specified}
+Location: {location or "Virtual" if not specified}
 
 Please reply with times you are available. You can respond in any format that works for you.
 
@@ -148,7 +285,7 @@ Time: {start_time} - {end_time} {primary_timezone}
 Time in EST: 4:00 PM - 5:00 PM
 Time in PST: 1:00 PM - 2:00 PM}
 Duration: {duration}
-Location: {location or "Virtual"}
+Location: {location with specific details}
 
 PARTICIPANTS:
 - {organizer_name} (Organizer)
@@ -465,6 +602,9 @@ export async function POST(req: Request) {
            webhook_target_address: recipientEmail || 'unknown',
            participants: sessionParticipants,
            organizer_timezone: detectTimeZone(textBody, senderEmail), // Add organizer timezone
+           meeting_duration: detectMeetingDuration(textBody), // Add meeting duration
+           meeting_location: detectMeetingLocation(textBody).location, // Add meeting location
+           is_virtual: detectMeetingLocation(textBody).isVirtual, // Add whether meeting is virtual
          })
          .select('session_id, organizer_email, participants')
          .single();
@@ -551,23 +691,25 @@ ${textBody}`;
 
     // Fetch time zone information if available
     let timeZoneContext = '';
-    const { data: sessionTimeZones } = await supabase
+    let meetingDetailsContext = '';
+    const { data: sessionDetails } = await supabase
       .from('scheduling_sessions')
-      .select('organizer_timezone, participant_timezones')
+      .select('organizer_timezone, participant_timezones, meeting_duration, meeting_location, is_virtual')
       .eq('session_id', sessionId)
       .single();
     
-    if (sessionTimeZones) {
+    if (sessionDetails) {
+      // Process time zones
       let timeZones = [];
       
-      if (sessionTimeZones.organizer_timezone) {
-        timeZones.push(`${sessionOrganizer} (Organizer): ${sessionTimeZones.organizer_timezone}`);
+      if (sessionDetails.organizer_timezone) {
+        timeZones.push(`${sessionOrganizer} (Organizer): ${sessionDetails.organizer_timezone}`);
       }
       
-      if (sessionTimeZones.participant_timezones) {
-        const participantTzs = typeof sessionTimeZones.participant_timezones === 'string' 
-          ? JSON.parse(sessionTimeZones.participant_timezones) 
-          : sessionTimeZones.participant_timezones;
+      if (sessionDetails.participant_timezones) {
+        const participantTzs = typeof sessionDetails.participant_timezones === 'string' 
+          ? JSON.parse(sessionDetails.participant_timezones) 
+          : sessionDetails.participant_timezones;
           
         for (const [email, tz] of Object.entries(participantTzs)) {
           timeZones.push(`${email}: ${tz}`);
@@ -577,11 +719,27 @@ ${textBody}`;
       if (timeZones.length > 0) {
         timeZoneContext = `\n\nKnown Time Zones:\n${timeZones.join('\n')}`;
       }
+      
+      // Process meeting details
+      let meetingDetails = [];
+      
+      if (sessionDetails.meeting_duration) {
+        meetingDetails.push(`Duration: ${sessionDetails.meeting_duration}`);
+      }
+      
+      if (sessionDetails.meeting_location) {
+        const locationType = sessionDetails.is_virtual ? 'Virtual Location' : 'Physical Location';
+        meetingDetails.push(`${locationType}: ${sessionDetails.meeting_location}`);
+      }
+      
+      if (meetingDetails.length > 0) {
+        meetingDetailsContext = `\n\nMeeting Details:\n${meetingDetails.join('\n')}`;
+      }
     }
 
     const messagesForAI: CoreMessage[] = [
       ...conversationHistory,
-      { role: 'user', content: currentMessageContent + timeZoneContext },
+      { role: 'user', content: currentMessageContent + timeZoneContext + meetingDetailsContext },
     ];
     console.log(`Sending ${messagesForAI.length} messages to AI (excluding system prompt).`);
 
@@ -669,12 +827,27 @@ ${textBody}`;
       console.warn(`AI decided next step: ${next_step}, but no valid recipients/body found. No email sent.`);
     }
 
-    // --- Update Session State --- 
+    // --- Update Session State and any detected information --- 
+    const sessionUpdateData: Record<string, any> = { current_step: next_step };
+    
+    // Check for duration and location in the latest message
+    const detectedDuration = detectMeetingDuration(textBody);
+    if (detectedDuration) {
+      sessionUpdateData.meeting_duration = detectedDuration;
+    }
+    
+    const detectedLocation = detectMeetingLocation(textBody);
+    if (detectedLocation.location) {
+      sessionUpdateData.meeting_location = detectedLocation.location;
+      sessionUpdateData.is_virtual = detectedLocation.isVirtual;
+    }
+    
     const { error: updateSessionError } = await supabase
       .from('scheduling_sessions')
-      .update({ current_step: next_step })
+      .update(sessionUpdateData)
       .eq('session_id', sessionId);
-    if (updateSessionError) console.error('Supabase error updating session step:', updateSessionError);
+      
+    if (updateSessionError) console.error('Supabase error updating session info:', updateSessionError);
 
     // --- Return Success Response to Postmark --- 
     console.log("Processing complete, returning 200 OK to Postmark.");

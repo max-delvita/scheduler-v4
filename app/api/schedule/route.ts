@@ -33,7 +33,7 @@ const systemMessage = `You are an AI assistant specialized in scheduling meeting
 Your primary goal is to coordinate a meeting time between an organizer and one or more participants.
 
 Follow these steps:
-1.  Analyze the incoming email (From, Subject, Body) and the entire conversation history.
+1.  Analyze the incoming email (From Name and Email, Subject, Body) and the entire conversation history.
 2.  Determine the current state and the most logical next step in the scheduling process.
 3.  Identify the specific recipient(s) for the next communication.
 4.  Generate the plain text email body for the next communication.
@@ -41,7 +41,7 @@ Follow these steps:
 
 Workflow Stages & 'next_step' values:
 *   Initial Request Received (often CC'd): Identify participants from To/Cc (excluding organizer/self). The identified participants are listed in the user message. If the core intent is clearly to schedule a meeting and at least one participant is identified, prioritize using 'ask_participant_availability' and set 'recipients' to ONLY those identified participant emails. Assume standard meeting duration (e.g., 30-60 mins) if unspecified. Only use 'request_clarification' (emailing the organizer) if the meeting's *purpose* is completely unclear OR if *no participants* could be identified.
-*   Receiving Availability: If more participants need checking, use 'ask_participant_availability' or 'propose_time_to_participant' for the *next* participant listed in the session. If all participants responded, use 'propose_time_to_organizer' and email *only* the organizer with proposed time(s).
+*   Receiving Availability: Analyze the sender's response (using their name if available, e.g., "Bob mentioned he is available..."). If more participants need checking, use 'ask_participant_availability' or 'propose_time_to_participant' for the *next* participant listed in the session. If all participants responded, use 'propose_time_to_organizer' and email *only* the organizer with proposed time(s), clearly stating who suggested which times (e.g., "Bob suggested Tuesday at 4pm.").
 *   Organizer Confirmation: If organizer agrees, use 'send_final_confirmation' and include *all* participants and the organizer in recipients. If organizer disagrees/suggests changes, go back to asking participants using 'ask_participant_availability' or 'propose_time_to_participant'.
 *   Final Confirmation: Generate a summary email body and include all participants+organizer in recipients.
 *   No Action: If the email is just a thank you or doesn't require a scheduling action, use 'no_action_needed' with empty recipients/body.
@@ -51,7 +51,8 @@ IMPORTANT EMAIL BODY RULES:
 *   The 'email_body' field should contain ONLY the text for the email body.
 *   Do NOT include greetings like "Hi [Name]," unless the 'recipients' array contains exactly ONE email address.
 *   Do NOT include subject lines.
-*   Be clear, concise, and professional.`;
+*   Be clear, concise, and professional.
+*   **Crucially: When relaying availability or proposing times based on a participant's response, refer to them by name if you know it (e.g., "Alice suggested...", "Regarding Bob's availability..."). Do not attribute availability to yourself (Amy).**`;
 
 // Helper function to map DB message types to AI CoreMessage roles
 function mapDbMessageToCoreMessage(dbMessage: { message_type: string; body_text: string | null }): CoreMessage | null {
@@ -150,6 +151,7 @@ export async function POST(req: Request) {
   // Extract key info
   const mailboxHash = postmarkPayload.MailboxHash;
   const senderEmail = postmarkPayload.FromFull?.Email || postmarkPayload.From;
+  const senderName = postmarkPayload.FromFull?.Name || senderEmail; // Extract name, fallback to email
   const recipientEmail = postmarkPayload.OriginalRecipient;
   const subject = postmarkPayload.Subject || '(no subject)';
   const textBody = postmarkPayload.TextBody || '';
@@ -402,7 +404,7 @@ export async function POST(req: Request) {
 
     // --- Prepare for AI (Include explicit participant list) --- 
     const currentMessageContent = `Received email:
-From: ${senderEmail}
+From: ${senderName} <${senderEmail}>
 Subject: ${subject}
 Participants involved in this session: ${sessionParticipants.join(', ') || 'None listed'}
 

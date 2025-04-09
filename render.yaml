@@ -22,25 +22,25 @@
 
 
 
-    services:
+  services:
   - type: web
-    name: Scheduler_agent_PROD
+    name: Scheduler_agent PROD
     runtime: node
     envVars:
       - key: NODE_ENV
         value: production
-    # ... other service configurations
+    # ... other configurations like buildCommand, startCommand, etc.
 
   - type: cron
     name: nudge-scheduler
     runtime: node
-    # repo: https://github.com/your-repo.git
-    schedule: "*/2 * * * *" 
-    buildCommand: 'echo "No Build Required"'
+    repo: https://github.com/max-delvita/scheduler-v4
+    schedule: "*/2 * * * *" # Runs every 2 minutes
+    buildCommand: 'echo "No build step required"'
     startCommand: 'curl -sf ${RENDER_EXTERNAL_URL}/api/cron/nudge'
     envVars:
-      - key: RENDER_EXTERNAL_URL
+      - key: https://meeting-scheduler-9xa3.onrender.com
         fromService:
-          name: Scheduler_agent_PROD
+          name: scheduler-agent-prod
           type: web
           property: hostport

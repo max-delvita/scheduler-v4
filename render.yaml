@@ -2,9 +2,12 @@
 # Make sure 'services' includes your main web service definition
 
 services:
-  - type: web # Or your specific service type (e.g., node)
-    name: your-web-service-name # Replace with your actual service name on Render
+  - type: web # Or whatever your service type is
+    name: Scheduler_agent PROD # Or your service name
     env: node # Or your runtime
+    envVars:
+      - key: NODE_ENV
+        value: production
     # ... other service configurations (build command, start command, env vars, etc.)
 
 cronJobs:
@@ -16,3 +19,12 @@ cronJobs:
     # If using CRON_SECRET, add the -H header as shown in the commented line
     command: curl -sf ${RENDER_EXTERNAL_URL}/api/cron/nudge
     # command: curl -sf -H "Authorization: Bearer $CRON_SECRET" ${RENDER_EXTERNAL_URL}/api/cron/nudge # <-- Use this if using CRON_SECRET
+
+# Add or uncomment the cron jobs section
+cron:
+  - job: nudgeParticipants # Give your job a name
+    schedule: "*/2 * * * *" # Example: Run every 5 minutes. Adjust as needed!
+    # Uncomment and adjust the command:
+    command: curl -sf ${RENDER_EXTERNAL_URL}/api/cron/nudge 
+    # If you add CRON_SECRET checking in your API:
+    # command: curl -sf -H "Authorization: Bearer $CRON_SECRET" ${RENDER_EXTERNAL_URL}/api/cron/nudge

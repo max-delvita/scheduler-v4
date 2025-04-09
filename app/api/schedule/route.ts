@@ -171,6 +171,12 @@ export async function POST(req: Request) {
   const inReplyToHeaderRaw = findHeader('In-Reply-To');
   const referencesHeader = findHeader('References');
 
+  // --- Find the ACTUAL Message-ID header for threading ---
+  const rawMessageIdHeader = findHeader('Message-ID');
+  // Extract the value *between* the angle brackets < >
+  // If match fails, fallback to Postmark's ID or generate a temporary one.
+  const actualMessageIdHeaderValue = rawMessageIdHeader?.match(/<(.+)>/)?.[1] || messageId || `missing-message-id-${Date.now()}`;
+
   // --- Loop Prevention & Logging Check --- 
   if (senderEmail.toLowerCase() === agentEmail) {
     console.log(`Received email FROM the agent itself (${senderEmail}). Checking for MailboxHash...`);
@@ -206,7 +212,7 @@ export async function POST(req: Request) {
   // --- End Loop Prevention Check ---
 
   // Log key extracted info if proceeding
-  console.log(`Extracted Info: From=${senderEmail}, Subject=${subject}, MessageID=${messageId}, MailboxHash=${mailboxHash || 'None'}, InReplyToRaw=${inReplyToHeaderRaw || 'None'}`);
+  console.log(`Extracted Info: From=${senderEmail}, Subject=${subject}, PostmarkID=${messageId}, ActualMessageIDHeader=${actualMessageIdHeaderValue}, MailboxHash=${mailboxHash || 'None'}, InReplyToRaw=${inReplyToHeaderRaw || 'None'}`);
 
   let sessionId: string | null = null;
   let conversationHistory: CoreMessage[] = [];
@@ -296,12 +302,12 @@ export async function POST(req: Request) {
              .map(mapDbMessageToCoreMessage)
              .filter((msg): msg is CoreMessage => msg !== null);
            // Use the FIRST message's ID for the overall thread reference
-           initialMessageIdForThread = historyMessages[0]?.postmark_message_id || null;
+           initialMessageIdForThread = actualMessageIdHeaderValue || null;
            console.log(`Loaded ${conversationHistory.length} history messages.`);
          } else {
              console.log("Session found, but no history messages retrieved.");
              // If history is empty, maybe use the current message ID as the initial reference?
-             initialMessageIdForThread = messageId || null;
+             initialMessageIdForThread = actualMessageIdHeaderValue || null;
          }
     }
 
@@ -363,7 +369,7 @@ export async function POST(req: Request) {
        sessionOrganizer = newSession.organizer_email;
        sessionParticipants = newSession.participants || [];
        conversationHistory = [];
-       initialMessageIdForThread = messageId || null; 
+       initialMessageIdForThread = actualMessageIdHeaderValue || null; 
        console.log(`Created new session: ${sessionId}`);
     }
 
@@ -381,7 +387,7 @@ export async function POST(req: Request) {
     console.log(`Saving incoming message as type: ${incomingMessageType}`);
     const { error: insertError } = await supabase.from('session_messages').insert({
         session_id: sessionId,
-        postmark_message_id: messageId,
+        postmark_message_id: actualMessageIdHeaderValue,
         sender_email: senderEmail,
         recipient_email: recipientEmail,
         subject: subject,
@@ -468,8 +474,8 @@ ${textBody}`;
             subject: outgoingSubject,
             textBody: email_body,
             sessionId, // Pass session ID for Reply-To construction
-            triggeringMessageId: messageId, // Pass the ID of the email we received
-            triggeringReferencesHeader: referencesHeader || null // Pass the References from the received email
+            triggeringMessageId: actualMessageIdHeaderValue, // Pass the *actual* header value
+            triggeringReferencesHeader: referencesHeader || null, // Pass the References from the received email
         });
     // --- Save AI Response --- 
     console.log("Saving AI response to DB.");
@@ -483,8 +489,7 @@ ${textBody}`;
                 subject: outgoingSubject,
                 body_text: email_body,
                 message_type: 'ai_agent',
-                // @ts-ignore - Still need to bypass this for incoming messageId?
-                in_reply_to_message_id: messageId || null, // Link to the ID of the triggering email
+                in_reply_to_message_id: actualMessageIdHeaderValue, // Link to the ID of the triggering email using the *actual* header value
             });
     if (aiSaveError) console.error('Supabase error saving AI message:', aiSaveError);
     else console.log("AI Response saved to DB.");
